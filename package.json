@@ -1,0 +1,21 @@
+{
+  "name": "obsidian-brain-companion",
+  "version": "0.1.0",
+  "description": "Obsidian plugin that exposes live runtime state (active editor, Dataview, Bases) to the obsidian-brain MCP server over a localhost HTTP endpoint.",
+  "main": "main.js",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "dev": "node esbuild.config.mjs",
+    "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production"
+  },
+  "keywords": ["obsidian-plugin", "mcp", "dataview", "obsidian-brain"],
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "esbuild": "0.25.5",
+    "obsidian": "latest",
+    "tslib": "2.4.0",
+    "typescript": "^5.8.3"
+  }
+}
