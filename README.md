@@ -22,7 +22,7 @@ On plugin load:
 
 1. Binds an HTTP server to `127.0.0.1` on a configurable port (default `27125`).
 2. Generates a random bearer token (regenerated every startup, never persisted).
-3. Writes a discovery file to `{VAULT}/.obsidian/plugins/obsidian-brain-companion/discovery.json` with `{port, token, pid, pluginVersion, startedAt}`.
+3. Writes a discovery file to `{VAULT}/.obsidian/plugins/obsidian-brain-companion/discovery.json` with `{port, token, pid, pluginVersion, startedAt, capabilities}`. The `capabilities` field (new in v0.2.0) is a string array like `["status", "active", "dataview"]` — the server uses it to fail fast on capability-gated tool calls when an older plugin is installed.
 4. The `obsidian-brain` server, when started with `VAULT_PATH` pointed at the same vault, reads the discovery file to find the plugin.
 
 Every request is authenticated with `Authorization: Bearer <token>`. Unauthorized requests get a 401. The server binds strictly to `127.0.0.1`, never to a LAN-facing address.
@@ -31,14 +31,14 @@ On plugin unload, the HTTP server shuts down and the discovery file is removed.
 
 ## Endpoints
 
-| Method | Path | Purpose |
-|---|---|---|
-| GET | `/status` | Health check + plugin version + vault name. |
-| GET | `/active` | Active note path + cursor + selection. |
-| POST | `/dataview` | _(v0.2)_ Run a DQL query via the Dataview plugin. |
-| POST | `/base` | _(v0.3)_ Evaluate a `.base` file and return rows. |
+| Method | Path | Purpose | Shipped |
+|---|---|---|---|
+| GET | `/status` | Health check + plugin version + vault name + advertised capabilities. | v0.1.0 |
+| GET | `/active` | Active note path + cursor + selection. | v0.1.0 |
+| POST | `/dataview` | Run a Dataview DQL query via the installed Dataview community plugin. Returns a normalized `{kind, ...}` shape (table / list / task / calendar). Requires the Dataview plugin installed + enabled; returns `424` otherwise. | v0.2.0 |
+| POST | `/base` | Evaluate a `.base` file and return rows. | v0.3.0 (planned) |
 
-All responses are JSON.
+All responses are JSON. `POST /dataview` accepts a body of `{query: string, source?: string}` up to 256KB; requests are serialised (one in-flight at a time) since Dataview has no cancellation API.
 
 ## Install
 
@@ -60,7 +60,11 @@ All responses are JSON.
 npm install -g obsidian-brain
 ```
 
-Then point your MCP client at `obsidian-brain server`. When both are running and the client has `VAULT_PATH` set to the same vault this plugin is installed in, the server discovers the plugin on boot and the `active_note` / `dataview_query` / `base_query` tools become available.
+Then point your MCP client at `obsidian-brain server`. When both are running and the client has `VAULT_PATH` set to the same vault this plugin is installed in, the server discovers the plugin on boot and the capability-gated tools become available:
+
+- `active_note` — server v1.2.0+, plugin v0.1.0+.
+- `dataview_query` — server v1.3.0+, plugin v0.2.0+, plus the Dataview community plugin installed and enabled in the vault.
+- `base_query` — planned for server v1.4.0 + plugin v0.3.0.
 
 See [`sweir1/obsidian-brain`](https://github.com/sweir1/obsidian-brain) for full setup.
 
