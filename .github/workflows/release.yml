@@ -21,11 +21,20 @@ jobs:
 
       - run: npm run build
 
-      - name: Create release
+      # Idempotent: if the release already exists (e.g. the maintainer
+      # pre-created it with richer notes), just refresh the built assets;
+      # otherwise create it with a minimal auto-note.
+      - name: Create or refresh release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create "$GITHUB_REF_NAME" \
-            --title "$GITHUB_REF_NAME" \
-            --notes "Release $GITHUB_REF_NAME — see README for install + usage." \
-            main.js manifest.json
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "Release $GITHUB_REF_NAME already exists — uploading/refreshing assets."
+            gh release upload "$GITHUB_REF_NAME" main.js manifest.json --clobber
+          else
+            echo "Release $GITHUB_REF_NAME does not exist — creating with auto-note."
+            gh release create "$GITHUB_REF_NAME" \
+              --title "$GITHUB_REF_NAME" \
+              --notes "Release $GITHUB_REF_NAME — see README for install + usage." \
+              main.js manifest.json
+          fi
