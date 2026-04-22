@@ -6,6 +6,7 @@ import {
   handleDataview,
   type DataviewRequestBody,
 } from "./handlers/dataview";
+import { handleBase, type BaseRequestBody } from "./handlers/base";
 
 export interface ServerOptions {
   app: App;
@@ -26,6 +27,12 @@ export class CompanionServer {
    * pathological query runs to completion. One at a time keeps CPU bounded.
    */
   private dataviewChain: Promise<void> = Promise.resolve();
+  /**
+   * Serialises /base evaluation for the same reason — the Path B evaluator
+   * walks every markdown file in the vault to build entries, which can be
+   * CPU-heavy on large vaults. One at a time keeps CPU bounded.
+   */
+  private baseChain: Promise<void> = Promise.resolve();
 
   constructor(private opts: ServerOptions) {}
 
@@ -74,6 +81,9 @@ export class CompanionServer {
         case "POST /dataview":
           this.runDataview(req, res);
           return;
+        case "POST /base":
+          this.runBase(req, res);
+          return;
         default:
           res.statusCode = 404;
           res.setHeader("content-type", "application/json");
@@ -100,7 +110,7 @@ export class CompanionServer {
     const task = async () => {
       let body: DataviewRequestBody;
       try {
-        body = await readJsonBody(req);
+        body = await readJsonBody<DataviewRequestBody>(req);
       } catch (err) {
         res.statusCode = 400;
         res.setHeader("content-type", "application/json");
@@ -118,9 +128,37 @@ export class CompanionServer {
     // Chain onto the previous dataview job so only one runs at a time.
     this.dataviewChain = this.dataviewChain.then(task, task);
   }
+
+  private runBase(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+  ): void {
+    const task = async () => {
+      let body: BaseRequestBody;
+      try {
+        body = await readJsonBody<BaseRequestBody>(req);
+      } catch (err) {
+        res.statusCode = 400;
+        res.setHeader("content-type", "application/json");
+        res.end(
+          JSON.stringify({
+            error: "bad_request",
+            message: err instanceof Error ? err.message : String(err),
+          }),
+        );
+        return;
+      }
+      await handleBase(res, this.opts.app, body);
+    };
+
+    // Chain onto the previous base job so only one runs at a time.
+    this.baseChain = this.baseChain.then(task, task);
+  }
 }
 
-function readJsonBody(req: http.IncomingMessage): Promise<DataviewRequestBody> {
+function readJsonBody<T = Record<string, unknown>>(
+  req: http.IncomingMessage,
+): Promise<T> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     let total = 0;
@@ -135,12 +173,12 @@ function readJsonBody(req: http.IncomingMessage): Promise<DataviewRequestBody> {
     });
     req.on("end", () => {
       if (chunks.length === 0) {
-        resolve({});
+        resolve({} as T);
         return;
       }
       try {
         const raw = Buffer.concat(chunks).toString("utf8");
-        const parsed = JSON.parse(raw) as DataviewRequestBody;
+        const parsed = JSON.parse(raw) as T;
         if (typeof parsed !== "object" || parsed === null) {
           reject(new Error("request body must be a JSON object"));
           return;

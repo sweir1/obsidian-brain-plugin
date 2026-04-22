@@ -9,8 +9,8 @@ export interface DiscoveryRecord {
   /**
    * Feature capabilities this plugin version exposes. The server uses this to
    * gate capability-requiring tools before the HTTP call — e.g., `dataview_query`
-   * requires "dataview". Older plugins without this field are treated as
-   * `["status", "active"]`.
+   * requires "dataview", `base_query` requires "base" (v1.4.0+). Older
+   * plugins without this field are treated as `["status", "active"]`.
    */
   capabilities: string[];
 }
