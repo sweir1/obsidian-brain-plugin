@@ -1,7 +1,7 @@
 {
   "id": "obsidian-brain-companion",
   "name": "obsidian-brain companion",
-  "version": "1.5.5",
+  "version": "1.6.0",
   "minAppVersion": "1.0.0",
   "description": "Exposes Obsidian's live runtime state (active editor, Dataview, Bases) to the obsidian-brain MCP server via a localhost HTTP endpoint. Paired with the obsidian-brain npm package.",
   "author": "sweir1",
