@@ -44,6 +44,8 @@ All responses are JSON. `POST /dataview` accepts a body of `{query: string, sour
 
 ## About the "Dataview community plugin"
 
+> **Install first:** Dataview is a separate third-party community plugin (not shipped with Obsidian, not built by us). Install in Obsidian → Settings → Community plugins → Browse → search "Dataview" (by blacksmithgu) → Install → Enable, then reload Obsidian once so its API registers on `app.plugins.plugins.dataview.api`. Without Dataview installed and enabled, our `/dataview` route returns 424. DQL syntax reference: <https://blacksmithgu.github.io/obsidian-dataview/>.
+
 The name is genuinely confusing because three pieces of software are involved, two of which are ours and one of which isn't:
 
 | # | Name | Who wrote it | What it does |
