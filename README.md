@@ -58,7 +58,7 @@ The name is genuinely confusing because three pieces of software are involved, t
 | npm `obsidian-dataview` | **0.5.68** | Developers who `npm install -D obsidian-dataview` for type defs | 2025-03-15 |
 | Dataview's upstream "Develop Against Dataview" docs page | says `0.5.64` | — (the page is stale) | — |
 
-The npm → GitHub lag is ~3 weeks. Practically irrelevant: the runtime behaviour a plugin sees through `getAPI(app)` is whatever the user actually has installed — typically 0.5.70. The npm version only affects slightly older TypeScript types in developer IDE autocomplete.
+What actually matters: the runtime behaviour a plugin sees through `getAPI(app)` is whatever the user has installed in their vault — typically 0.5.70. The npm version only affects TypeScript autocomplete during development.
 
 **We do not reimplement DQL.** Our companion plugin calls into Dataview's plugin API from inside the same Obsidian process:
 
