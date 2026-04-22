@@ -40,6 +40,48 @@ On plugin unload, the HTTP server shuts down and the discovery file is removed.
 
 All responses are JSON. `POST /dataview` accepts a body of `{query: string, source?: string}` up to 256KB; requests are serialised (one in-flight at a time) since Dataview has no cancellation API.
 
+## About the "Dataview community plugin"
+
+The name is genuinely confusing because three pieces of software are involved, two of which are ours and one of which isn't:
+
+| # | Name | Who wrote it | What it does |
+|---|---|---|---|
+| 1 | **`obsidian-brain`** | us — [sweir1/obsidian-brain](https://github.com/sweir1/obsidian-brain) | The MCP server (Node package on npm). Your MCP client spawns it. |
+| 2 | **`obsidian-brain-companion`** | us — this repo | The Obsidian plugin you're reading docs for. Exposes `/dataview`. |
+| 3 | **Dataview** (`obsidian-dataview`) | [blacksmithgu](https://github.com/blacksmithgu/obsidian-dataview) | A third-party Obsidian community plugin with ~4M+ installs ([community-plugin-stats.json](https://raw.githubusercontent.com/obsidianmd/obsidian-releases/master/community-plugin-stats.json): 4,008,313 as of April 2025). Implements the Dataview Query Language (DQL) and maintains an in-memory index of the vault. Current version `0.5.68` on npm (published 2025-03-15). |
+
+**We do not reimplement DQL.** Our companion plugin calls into Dataview's plugin API from inside the same Obsidian process:
+
+```ts
+// Sanctioned path per Dataview's plugin-author guide
+// (https://blacksmithgu.github.io/obsidian-dataview/resources/develop-against-dataview/):
+import { getAPI } from "obsidian-dataview";
+const api = getAPI(app);
+
+// What our companion plugin actually uses (no runtime dep on obsidian-dataview):
+const api = app.plugins.plugins.dataview?.api;
+
+// Either way, the same query:
+const result = await api.query(userQuery);
+```
+
+These aren't just "equivalent" — they're literally the same lookup. `getAPI(app)` is implemented in [`src/index.ts` L49-52](https://github.com/blacksmithgu/obsidian-dataview/blob/master/src/index.ts) as a thin wrapper:
+
+```ts
+export const getAPI = (app?: App): DataviewApi | undefined => {
+  if (app) return app.plugins.plugins.dataview?.api;
+  else return window["DataviewAPI"];
+};
+```
+
+So our plugin-global call resolves to exactly the same `DataviewApi` object `getAPI()` would return. We use the back-door path because it avoids pulling the `obsidian-dataview` npm package into our runtime closure — saves ~5MB of devDep install that esbuild would otherwise bundle types from.
+
+**Install Dataview in Obsidian** (not via npm) — Settings → Community plugins → Browse → search "Dataview" (by blacksmithgu) → Install → Enable. Then reload Obsidian once so its API registers on the `app.plugins.plugins.dataview` global. Without this, our `/dataview` route returns 424 with an install-prompt message.
+
+**`index-ready` caveat.** Dataview builds its index asynchronously on Obsidian startup and fires `app.metadataCache.on("dataview:index-ready", ...)` when done (trigger site: [`src/data-index/index.ts` L152](https://github.com/blacksmithgu/obsidian-dataview/blob/master/src/data-index/index.ts)). Before that event, `api.query()` may return incomplete results against a partial index. In practice reindexing is fast enough that interactive use rarely notices, but if you run `dataview_query` within the first few seconds of Obsidian startup and get surprisingly few rows, retry once the index has warmed.
+
+Further reading: Dataview's [plugin-author guide](https://blacksmithgu.github.io/obsidian-dataview/resources/develop-against-dataview/), [plugin-api.ts source](https://github.com/blacksmithgu/obsidian-dataview/blob/master/src/api/plugin-api.ts), [DQL query structure](https://blacksmithgu.github.io/obsidian-dataview/queries/structure/). Note: Dataview's upstream docs still say "latest version is 0.5.64" — npm shows 0.5.68; the doc page is stale.
+
 ## Install
 
 ### Via BRAT (recommended while pre-release)
