@@ -6,6 +6,13 @@ export interface DiscoveryRecord {
   pid: number;
   pluginVersion: string;
   startedAt: number;
+  /**
+   * Feature capabilities this plugin version exposes. The server uses this to
+   * gate capability-requiring tools before the HTTP call — e.g., `dataview_query`
+   * requires "dataview". Older plugins without this field are treated as
+   * `["status", "active"]`.
+   */
+  capabilities: string[];
 }
 
 /**

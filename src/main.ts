@@ -37,6 +37,7 @@ export default class ObsidianBrainCompanion extends Plugin {
         pid: process.pid,
         pluginVersion: this.manifest.version,
         startedAt: Date.now(),
+        capabilities: ["status", "active", "dataview"],
       });
 
       console.info(

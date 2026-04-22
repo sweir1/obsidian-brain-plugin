@@ -2,6 +2,10 @@ import * as http from "http";
 import type { App, PluginManifest } from "obsidian";
 import { handleStatus } from "./handlers/status";
 import { handleActive } from "./handlers/active";
+import {
+  handleDataview,
+  type DataviewRequestBody,
+} from "./handlers/dataview";
 
 export interface ServerOptions {
   app: App;
@@ -11,9 +15,17 @@ export interface ServerOptions {
   port: number;
 }
 
+const MAX_BODY_BYTES = 256 * 1024; // 256KB — DQL queries are human-authored, 256KB is already absurd.
+
 export class CompanionServer {
   private server: http.Server | null = null;
   private readyAt = 0;
+  /**
+   * Serialises expensive handlers (/dataview) so a second call can't stack
+   * behind a stuck first one — Dataview has no cancellation API, so a
+   * pathological query runs to completion. One at a time keeps CPU bounded.
+   */
+  private dataviewChain: Promise<void> = Promise.resolve();
 
   constructor(private opts: ServerOptions) {}
 
@@ -59,6 +71,9 @@ export class CompanionServer {
           return handleStatus(res, this.opts.manifest, this.opts.app, this.readyAt);
         case "GET /active":
           return handleActive(res, this.opts.app);
+        case "POST /dataview":
+          this.runDataview(req, res);
+          return;
         default:
           res.statusCode = 404;
           res.setHeader("content-type", "application/json");
@@ -77,4 +92,70 @@ export class CompanionServer {
       );
     }
   }
+
+  private runDataview(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+  ): void {
+    const task = async () => {
+      let body: DataviewRequestBody;
+      try {
+        body = await readJsonBody(req);
+      } catch (err) {
+        res.statusCode = 400;
+        res.setHeader("content-type", "application/json");
+        res.end(
+          JSON.stringify({
+            error: "bad_request",
+            message: err instanceof Error ? err.message : String(err),
+          }),
+        );
+        return;
+      }
+      await handleDataview(res, this.opts.app, body);
+    };
+
+    // Chain onto the previous dataview job so only one runs at a time.
+    this.dataviewChain = this.dataviewChain.then(task, task);
+  }
+}
+
+function readJsonBody(req: http.IncomingMessage): Promise<DataviewRequestBody> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let total = 0;
+    req.on("data", (chunk: Buffer) => {
+      total += chunk.length;
+      if (total > MAX_BODY_BYTES) {
+        req.destroy();
+        reject(new Error(`request body exceeds ${MAX_BODY_BYTES} bytes`));
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on("end", () => {
+      if (chunks.length === 0) {
+        resolve({});
+        return;
+      }
+      try {
+        const raw = Buffer.concat(chunks).toString("utf8");
+        const parsed = JSON.parse(raw) as DataviewRequestBody;
+        if (typeof parsed !== "object" || parsed === null) {
+          reject(new Error("request body must be a JSON object"));
+          return;
+        }
+        resolve(parsed);
+      } catch (err) {
+        reject(
+          new Error(
+            `invalid JSON body: ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          ),
+        );
+      }
+    });
+    req.on("error", reject);
+  });
 }
