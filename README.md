@@ -172,6 +172,12 @@ Then point your MCP client at `obsidian-brain server`. When both are running and
 - `dataview_query` — server v1.3.0+, plugin v0.2.0+, plus the Dataview community plugin installed and enabled in the vault.
 - `base_query` — server v1.4.0+, plugin v1.4.0+, plus Obsidian ≥ 1.10.0 with the Bases core plugin enabled in the vault.
 
+### Version compatibility
+
+**Rule of thumb:** install the **same major.minor** on both sides. Server `1.5.x` pairs with plugin `1.5.x` — that's the tested, supported combo. Patch-version drift (e.g. server `1.5.4` + plugin `1.5.2`) is fine; patch releases don't change the protocol surface.
+
+Other combinations (e.g. older plugin + newer server) often work thanks to capability gating — the plugin advertises its supported routes in `discovery.json` and the server fails loudly with a clean "upgrade plugin vX.Y+" error if a required capability is missing — but aren't explicitly tested and aren't guaranteed. If you mix and something breaks, upgrade the lagging side.
+
 See [`sweir1/obsidian-brain`](https://github.com/sweir1/obsidian-brain) for full setup.
 
 ## Security
