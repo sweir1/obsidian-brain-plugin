@@ -48,7 +48,17 @@ The name is genuinely confusing because three pieces of software are involved, t
 |---|---|---|---|
 | 1 | **`obsidian-brain`** | us — [sweir1/obsidian-brain](https://github.com/sweir1/obsidian-brain) | The MCP server (Node package on npm). Your MCP client spawns it. |
 | 2 | **`obsidian-brain-companion`** | us — this repo | The Obsidian plugin you're reading docs for. Exposes `/dataview`. |
-| 3 | **Dataview** (`obsidian-dataview`) | [blacksmithgu](https://github.com/blacksmithgu/obsidian-dataview) | A third-party Obsidian community plugin with ~4M+ installs ([community-plugin-stats.json](https://raw.githubusercontent.com/obsidianmd/obsidian-releases/master/community-plugin-stats.json): 4,008,313 as of April 2025). Implements the Dataview Query Language (DQL) and maintains an in-memory index of the vault. Current version `0.5.68` on npm (published 2025-03-15). |
+| 3 | **Dataview** (`obsidian-dataview`) | [blacksmithgu](https://github.com/blacksmithgu/obsidian-dataview) | A third-party Obsidian community plugin with ~4M+ installs ([community-plugin-stats.json](https://raw.githubusercontent.com/obsidianmd/obsidian-releases/master/community-plugin-stats.json): 4,008,313 as of April 2025). Implements the Dataview Query Language (DQL) and maintains an in-memory index of the vault. |
+
+**Version landscape** (as of 2026-04-22):
+
+| Channel | Version | Who gets this | When |
+|---|---|---|---|
+| GitHub release (what Obsidian's Community Plugin browser pulls) | **0.5.70** | End users installing via Obsidian | 2025-04-07 |
+| npm `obsidian-dataview` | **0.5.68** | Developers who `npm install -D obsidian-dataview` for type defs | 2025-03-15 |
+| Dataview's upstream "Develop Against Dataview" docs page | says `0.5.64` | — (the page is stale) | — |
+
+The npm → GitHub lag is ~3 weeks. Practically irrelevant: the runtime behaviour a plugin sees through `getAPI(app)` is whatever the user actually has installed — typically 0.5.70. The npm version only affects slightly older TypeScript types in developer IDE autocomplete.
 
 **We do not reimplement DQL.** Our companion plugin calls into Dataview's plugin API from inside the same Obsidian process:
 
@@ -80,7 +90,7 @@ So our plugin-global call resolves to exactly the same `DataviewApi` object `get
 
 **`index-ready` caveat.** Dataview builds its index asynchronously on Obsidian startup and fires `app.metadataCache.on("dataview:index-ready", ...)` when done (trigger site: [`src/data-index/index.ts` L152](https://github.com/blacksmithgu/obsidian-dataview/blob/master/src/data-index/index.ts)). Before that event, `api.query()` may return incomplete results against a partial index. In practice reindexing is fast enough that interactive use rarely notices, but if you run `dataview_query` within the first few seconds of Obsidian startup and get surprisingly few rows, retry once the index has warmed.
 
-Further reading: Dataview's [plugin-author guide](https://blacksmithgu.github.io/obsidian-dataview/resources/develop-against-dataview/), [plugin-api.ts source](https://github.com/blacksmithgu/obsidian-dataview/blob/master/src/api/plugin-api.ts), [DQL query structure](https://blacksmithgu.github.io/obsidian-dataview/queries/structure/). Note: Dataview's upstream docs still say "latest version is 0.5.64" — npm shows 0.5.68; the doc page is stale.
+Further reading: Dataview's [plugin-author guide](https://blacksmithgu.github.io/obsidian-dataview/resources/develop-against-dataview/), [plugin-api.ts source](https://github.com/blacksmithgu/obsidian-dataview/blob/master/src/api/plugin-api.ts), [DQL query structure](https://blacksmithgu.github.io/obsidian-dataview/queries/structure/).
 
 ## Install
 

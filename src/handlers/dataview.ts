@@ -11,19 +11,66 @@ export interface DataviewRequestBody {
 interface ObsidianAppWithPlugins extends App {
   plugins?: {
     plugins?: Record<string, { api?: unknown } | undefined>;
+    enabledPlugins?: Set<string>;
   };
 }
 
-function getDataviewApi(app: App): DataviewApi | null {
+/**
+ * Resolve Dataview into one of four outcomes the caller can discriminate.
+ *
+ * We use the raw `app.plugins` surface rather than importing `obsidian-dataview`'s
+ * `getAPI()` / `isPluginEnabled()` helpers. Looking at the upstream source
+ * (reference/obsidian-dataview/src/index.ts:54 + :60) the helpers are literally:
+ *   getAPI(app)         === app.plugins.plugins.dataview?.api
+ *   isPluginEnabled(app) === app.plugins.enabledPlugins.has("dataview")
+ * Using the plugin-global fields directly avoids pulling obsidian-dataview as a
+ * runtime dependency while producing identical behaviour.
+ */
+export type ResolvedDataview =
+  | { ok: true; api: DataviewApi }
+  | { ok: false; kind: "not_installed" | "not_enabled" | "api_not_ready" };
+
+export function resolveDataview(app: App): ResolvedDataview {
   const withPlugins = app as ObsidianAppWithPlugins;
-  const dv = withPlugins.plugins?.plugins?.["dataview"];
-  if (!dv || typeof (dv as { api?: unknown }).api !== "object") return null;
-  const api = (dv as { api: unknown }).api;
-  if (api && typeof (api as { query?: unknown }).query === "function") {
-    return api as DataviewApi;
+  const registry = withPlugins.plugins;
+  const dv = registry?.plugins?.["dataview"];
+
+  if (!dv) return { ok: false, kind: "not_installed" };
+  if (!registry?.enabledPlugins?.has("dataview")) {
+    return { ok: false, kind: "not_enabled" };
   }
-  return null;
+
+  const api = (dv as { api?: unknown }).api;
+  if (
+    !api ||
+    typeof api !== "object" ||
+    typeof (api as { query?: unknown }).query !== "function"
+  ) {
+    return { ok: false, kind: "api_not_ready" };
+  }
+  return { ok: true, api: api as DataviewApi };
 }
+
+export const UNAVAILABLE_MESSAGES: Record<
+  "not_installed" | "not_enabled" | "api_not_ready",
+  { error: string; message: string }
+> = {
+  not_installed: {
+    error: "dataview_not_installed",
+    message:
+      "The Dataview community plugin is not installed in this vault. Install it: Obsidian → Settings → Community plugins → Browse → search 'Dataview' (by blacksmithgu) → Install → Enable.",
+  },
+  not_enabled: {
+    error: "dataview_not_enabled",
+    message:
+      "The Dataview community plugin is installed but not enabled in this vault. Obsidian → Settings → Community plugins → toggle 'Dataview' on, then retry.",
+  },
+  api_not_ready: {
+    error: "dataview_api_not_ready",
+    message:
+      "The Dataview community plugin is enabled but its API isn't registered on app.plugins.plugins.dataview yet. Reload Obsidian (Command palette → 'Reload app without saving', or ⌘R / Ctrl+R) and retry — this usually clears within a few seconds of enabling the plugin.",
+  },
+};
 
 export async function handleDataview(
   res: http.ServerResponse,
@@ -43,16 +90,10 @@ export async function handleDataview(
     return;
   }
 
-  const dv = getDataviewApi(app);
-  if (!dv) {
+  const resolved = resolveDataview(app);
+  if (!resolved.ok) {
     res.statusCode = 424;
-    res.end(
-      JSON.stringify({
-        error: "dataview_not_installed",
-        message:
-          "The Dataview community plugin is not installed or not enabled in this vault. Install it from Settings → Community plugins and retry.",
-      }),
-    );
+    res.end(JSON.stringify(UNAVAILABLE_MESSAGES[resolved.kind]));
     return;
   }
 
@@ -60,7 +101,7 @@ export async function handleDataview(
 
   let result;
   try {
-    result = await dv.query(body.query, source);
+    result = await resolved.api.query(body.query, source);
   } catch (err) {
     res.statusCode = 500;
     res.end(

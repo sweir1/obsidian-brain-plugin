@@ -1,7 +1,39 @@
+# Dependencies
 node_modules/
+
+# Build output (esbuild regenerates main.js every build; GH release action re-emits it)
 main.js
 *.js.map
+dist/
+
+# Reference clones — upstream sources pulled locally for greppable citations
+reference/
+
+# Plugin runtime data written by Obsidian at load time
 data.json
-.DS_Store
+
+# Test + type artifacts
+coverage/
+.vitest/
+*.tsbuildinfo
+
+# Environment + secrets
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+npm-debug.log*
+
+# Editor / IDE
 .vscode/
 .idea/
+*.swp
+*.swo
+*~
+
+# OS cruft
+.DS_Store
+Thumbs.db
+ehthumbs.db
