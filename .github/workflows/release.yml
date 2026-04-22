@@ -17,7 +17,11 @@ jobs:
         with:
           node-version: "20"
 
-      - run: npm ci
+      # Use `install` not `ci` — vitest@4 transitively pulls esbuild 0.28
+      # whose platform packages trip up `npm ci` on non-matching runners
+      # (EBADPLATFORM on openharmony-arm64 on linux-x64). `install` is
+      # lenient and still respects the lockfile for reproducibility.
+      - run: npm install --no-audit --no-fund
 
       - run: npm run build
 
