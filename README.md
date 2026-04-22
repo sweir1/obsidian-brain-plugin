@@ -1,5 +1,7 @@
 # obsidian-brain companion
 
+> **Companion to [`sweir1/obsidian-brain`](https://github.com/sweir1/obsidian-brain)** — see the [docs site](https://sweir1.github.io/obsidian-brain/plugin/) for setup walkthrough, the Dataview integration story, and security model.
+
 A small Obsidian plugin that exposes Obsidian's **live runtime state** (active editor, Dataview query results, Bases views) to the [`obsidian-brain`](https://github.com/sweir1/obsidian-brain) MCP server over a **localhost-only HTTP endpoint**.
 
 This plugin is **optional**. `obsidian-brain` works standalone against your vault's files on disk. Install this plugin only if you want the MCP tools that depend on Obsidian being open — `active_note`, `dataview_query`, `base_query`.
