@@ -1,24 +1,20 @@
 {
   "compilerOptions": {
-    "baseUrl": "src",
-    "inlineSourceMap": true,
-    "inlineSources": true,
     "module": "ESNext",
+    "moduleResolution": "bundler",
     "target": "ES2018",
+    "lib": ["DOM", "ES2018"],
+    "types": ["node"],
+    "noEmit": true,
     "allowJs": true,
-    "noImplicitAny": true,
-    "noImplicitThis": true,
+    "strict": true,
     "noImplicitReturns": true,
-    "moduleResolution": "node",
-    "importHelpers": true,
     "noUncheckedIndexedAccess": true,
     "isolatedModules": true,
-    "strictNullChecks": true,
-    "strictBindCallApply": true,
+    "importHelpers": true,
     "allowSyntheticDefaultImports": true,
     "useUnknownInCatchVariables": true,
-    "lib": ["DOM", "ES2018"]
+    "skipLibCheck": true
   },
-  "include": ["src/**/*.ts"],
-  "exclude": ["src/**/*.test.ts"]
+  "include": ["src/**/*.ts"]
 }

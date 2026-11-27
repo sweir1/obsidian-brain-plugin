@@ -208,9 +208,9 @@ describe("normalizeDataviewResult — task", () => {
     expect(out.kind).toBe("task");
     if (out.kind !== "task") throw new Error("wrong kind");
     expect(out.items).toHaveLength(1);
-    expect(out.items[0].task).toBe(true);
-    expect(out.items[0].children).toHaveLength(1);
-    expect(out.items[0].children[0].task).toBe(false);
+    expect(out.items[0]!.task).toBe(true);
+    expect(out.items[0]!.children).toHaveLength(1);
+    expect(out.items[0]!.children[0]!.task).toBe(false);
   });
 
   it("walks a Grouping tree ({key, rows}) and flattens into items", () => {
@@ -241,7 +241,7 @@ describe("normalizeDataviewResult — task", () => {
     expect(out.kind).toBe("task");
     if (out.kind !== "task") throw new Error("wrong kind");
     expect(out.items).toHaveLength(1);
-    expect(out.items[0].text).toBe("grouped task");
+    expect(out.items[0]!.text).toBe("grouped task");
   });
 });
 

@@ -122,7 +122,11 @@ export class CompanionServer {
         );
         return;
       }
-      await handleDataview(res, this.opts.app, body);
+      try {
+        await handleDataview(res, this.opts.app, body);
+      } catch (err) {
+        respondInternalError(res, err);
+      }
     };
 
     // Chain onto the previous dataview job so only one runs at a time.
@@ -148,12 +152,34 @@ export class CompanionServer {
         );
         return;
       }
-      await handleBase(res, this.opts.app, body);
+      try {
+        await handleBase(res, this.opts.app, body);
+      } catch (err) {
+        respondInternalError(res, err);
+      }
     };
 
     // Chain onto the previous base job so only one runs at a time.
     this.baseChain = this.baseChain.then(task, task);
   }
+}
+
+/**
+ * A handler threw something it didn't map to a response. Answer with a 500
+ * so the caller isn't left waiting until its timeout.
+ */
+function respondInternalError(res: http.ServerResponse, err: unknown): void {
+  if (res.writableEnded) return;
+  if (!res.headersSent) {
+    res.statusCode = 500;
+    res.setHeader("content-type", "application/json");
+  }
+  res.end(
+    JSON.stringify({
+      error: "internal",
+      message: err instanceof Error ? err.message : String(err),
+    }),
+  );
 }
 
 function readJsonBody<T = Record<string, unknown>>(

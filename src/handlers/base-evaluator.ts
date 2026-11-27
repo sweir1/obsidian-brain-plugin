@@ -1,843 +1,915 @@
-import type { App, TFile } from "obsidian";
-import { parseYaml } from "obsidian";
+import type { App, CachedMetadata, TFile } from "obsidian";
+import { getAllTags, parseYaml } from "obsidian";
+import {
+  BaseEvaluationError,
+  Duration,
+  FILE_FIELDS,
+  FileRef,
+  ResourceLimitError,
+  UnsupportedConstructError,
+  asDate,
+  compareValues,
+  equals,
+  evaluate,
+  fileField,
+  formatLocalDate,
+  formulaRefs,
+  isDateOnly,
+  isEmptyValue,
+  markDateOnly,
+  parseExpression,
+  toText,
+  truthy,
+  type BaseEntry,
+  type EvalContext,
+  type LinkResolver,
+  type Node,
+} from "./base-expr";
+
+export { UnsupportedConstructError, BaseEvaluationError, ResourceLimitError } from "./base-expr";
+export type { BaseEntry } from "./base-expr";
 
 /**
- * Path B evaluator for Obsidian Bases `.base` YAML files.
+ * Evaluates an Obsidian Bases `.base` file headlessly.
  *
- * Obsidian 1.12.x exposes `BasesEntry` / `BasesQueryResult` / `BasesView` types
- * and `Plugin.registerBasesView()` — a view-factory hook only. There is NO
- * public API to execute a bases query headlessly (no `app.bases.runQuery(...)`).
- * The forum request to expose `app.bases.getViewFiles()` opened 2026-01-31 is
- * still unacknowledged as of 2026-04-22. So until upstream exposes a read path,
- * we own YAML parsing + a whitelisted expression subset.
+ * Obsidian has no public API to run a base and read its rows, so the
+ * plugin parses the `.base` YAML itself, builds one entry per vault file
+ * from the metadata cache, and evaluates the filters / formulas with
+ * {@link ./base-expr}. The file format follows help.obsidian.md → Bases
+ * syntax (Obsidian 1.9 – 1.14):
  *
- * The v1.4.0 subset is INTENTIONALLY NARROW — it's the common case (tree ops
- * + comparisons + file props + frontmatter access). Arithmetic, functions,
- * method calls other than hasTag/inFolder, regex, formulas/summaries are all
- * rejected with a clear `UnsupportedConstructError` so callers see exactly
- * what needs to ship in v1.4.1+.
+ *   filters:   string | {and: [...]} | {or: [...]} | {not: [...]}
+ *   formulas:  {name: "expression"}
+ *   properties / summaries: display-only, ignored here
+ *   views:     a list of {type, name, filters, order, sort, limit,
+ *              groupBy, groupOrder, ...}
+ *
+ * Every view type (table, cards, list, kanban, map, plugin views) selects
+ * rows the same way, so the `type` is not interpreted. The legacy shapes an
+ * earlier version of this plugin accepted — `views` as a map keyed by name,
+ * `columns:` instead of `order:`, `sort: [{column}]`, `frontmatter.x`, and
+ * `{property: {op: value}}` filter shorthand — still work.
+ *
+ * Everything that depends only on the `.base` file (expressions, filter
+ * shape, which formulas a filter needs) is checked before any row is
+ * evaluated, so an error never depends on the vault's contents.
  */
 
-export class UnsupportedConstructError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "UnsupportedConstructError";
-  }
-}
-
-export class BaseEvaluationError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "BaseEvaluationError";
-  }
-}
-
-export interface BaseEntry {
-  file: {
-    name: string;
-    path: string;
-    folder: string;
-    ext: string;
-    size: number;
-    mtime: number;
-    ctime: number;
-    tags: string[];
-  };
-  frontmatter: Record<string, unknown>;
-}
-
-interface BaseDocument {
-  filters?: unknown;
-  views?: Record<string, ViewDefinition>;
-  formulas?: unknown;
-  summaries?: unknown;
-}
+/** Wall-clock budget for one evaluation. */
+export const DEFAULT_TIME_LIMIT_MS = 10_000;
+/** Most nodes a `filters:` tree may have, counting YAML aliases each time. */
+export const MAX_FILTER_NODES = 10_000;
+/** Deepest `and`/`or`/`not` nesting accepted. */
+export const MAX_FILTER_DEPTH = 64;
+/** Longest chain of formulas built on formulas. */
+export const MAX_FORMULA_DEPTH = 64;
+const MAX_WARNINGS = 20;
 
 interface ViewDefinition {
+  name?: unknown;
+  type?: unknown;
   filters?: unknown;
+  order?: unknown;
+  /** Legacy alias for `order`. */
+  columns?: unknown;
   sort?: unknown;
   limit?: unknown;
-  columns?: unknown;
-  type?: unknown;
+  groupBy?: unknown;
+  groupOrder?: unknown;
 }
 
 export interface BaseRow {
+  file: { name: string; basename: string; path: string };
   [column: string]: unknown;
+}
+
+export interface BaseGroup {
+  /** The grouped property's value; null for files without one. */
+  value: unknown;
+  /** Rows in this group, before `limit`. */
+  count: number;
 }
 
 export interface EvaluateOptions {
   yaml: string;
-  view: string;
+  /** View name; the first view when omitted (as Obsidian opens a base). */
+  view?: string;
+  /** Clock for `now()` / `today()` (tests). */
+  now?: Date;
+  /** Override the time budget (tests). */
+  timeLimitMs?: number;
 }
 
 export interface EvaluateResult {
+  /** Name of the view that ran (`null` for a base without views). */
+  view: string | null;
   rows: BaseRow[];
+  /** Matching rows before `limit`. */
   total: number;
+  /** Present when the view groups its rows (`groupBy`). */
+  groupBy?: string;
+  groups?: BaseGroup[];
+  /** Things that didn't stop the query but made some values null. */
+  warnings?: string[];
 }
 
-const SUPPORTED_CONSTRUCTS =
-  "[and/or/not, ==/!=/>/>=/</<=, &&/||/!, file.{name,path,folder,ext,size,mtime,ctime,tags}, file.hasTag(\"x\"), file.inFolder(\"x\"), frontmatter.X, bare X, nested X.sub.leaf]";
-
-const COMPARISON_OPS = new Set(["==", "!=", ">", ">=", "<", "<="]);
-
-/**
- * Top-level entry point: parse `.base` YAML, build entries from the vault,
- * filter + sort + limit + project, return rows + total (pre-limit count).
- */
-export function evaluateBase(
-  app: App,
-  opts: EvaluateOptions,
-): EvaluateResult {
-  const parsed = parseYaml(opts.yaml) as BaseDocument | null | undefined;
-  if (!parsed || typeof parsed !== "object") {
-    throw new BaseEvaluationError(
-      "Parsed `.base` YAML is empty or not an object.",
-    );
+export function evaluateBase(app: App, opts: EvaluateOptions): EvaluateResult {
+  try {
+    return run(app, opts);
+  } catch (err) {
+    // Last line of defence: any recursion we didn't bound is a 400, not a crash.
+    if (err instanceof RangeError && /call stack/i.test(err.message)) {
+      throw new ResourceLimitError("The base is nested too deeply to evaluate.");
+    }
+    throw err;
   }
+}
 
-  if ("formulas" in parsed && parsed.formulas !== undefined) {
-    throw new UnsupportedConstructError(
-      `Unsupported construct: 'formulas:' block at top level. Supported v1.4.0 constructs: ${SUPPORTED_CONSTRUCTS}. Formulas ship in v1.4.2.`,
-    );
-  }
-  if ("summaries" in parsed && parsed.summaries !== undefined) {
-    throw new UnsupportedConstructError(
-      `Unsupported construct: 'summaries:' block at top level. Supported v1.4.0 constructs: ${SUPPORTED_CONSTRUCTS}. Summaries ship in v1.4.3.`,
-    );
-  }
+function run(app: App, opts: EvaluateOptions): EvaluateResult {
+  const doc = parseBaseYaml(opts.yaml);
+  const warnings = new Set<string>();
+  const warn = (msg: string) => {
+    if (warnings.size < MAX_WARNINGS) warnings.add(msg);
+  };
 
-  const views = parsed.views;
-  if (!views || typeof views !== "object") {
-    throw new BaseEvaluationError(
-      "`.base` must contain a `views:` map with at least one named view.",
-    );
-  }
-  const viewDef = (views as Record<string, ViewDefinition>)[opts.view];
-  if (!viewDef || typeof viewDef !== "object") {
-    throw new BaseEvaluationError(
-      `View '${opts.view}' not found in .base file. Available views: ${Object.keys(
-        views,
-      ).join(", ") || "(none)"}.`,
-    );
-  }
+  const { name: viewName, def: view } = pickView(doc.views, opts.view);
 
-  const entries = collectEntries(app);
+  // ---- static checks: everything that depends only on the .base file ----
+  const globalFilter = compileFilter(doc.filters, "filters", warn);
+  const viewFilter = compileFilter(view.filters, "view filters", warn);
+  const sortKeys = readSort(view.sort);
+  const group = readGroupBy(view.groupBy);
+  const columns = readColumns(view.order !== undefined ? view.order : view.columns);
+  const formulas = compileFormulas(doc.formulas);
 
-  const topFilter = parsed.filters;
-  const viewFilter = viewDef.filters;
-  let filtered = entries;
-  if (topFilter !== undefined) {
-    filtered = filtered.filter((e) => evalFilter(topFilter, e));
+  // Formulas a filter, sort or group needs must work; a broken formula used
+  // only as a column becomes null cells and a warning.
+  const logicRefs = new Set<string>();
+  for (const f of [globalFilter, viewFilter]) filterFormulaRefs(f, logicRefs);
+  for (const id of [...sortKeys.map((k) => k.property), ...(group ? [group.property] : [])]) {
+    checkPropertyId(id, "sort/groupBy");
+    if (id.startsWith("formula.")) logicRefs.add(id.slice(8));
   }
-  if (viewFilter !== undefined) {
-    filtered = filtered.filter((e) => evalFilter(viewFilter, e));
+  for (const name of logicRefs) {
+    const problem = formulas.problem(name);
+    if (problem) throw problem;
   }
-
-  if (viewDef.sort !== undefined) {
-    filtered = applySort(filtered, viewDef.sort);
-  }
-
-  const total = filtered.length;
-
-  if (viewDef.limit !== undefined) {
-    const n = Number(viewDef.limit);
-    if (Number.isFinite(n) && n >= 0) {
-      filtered = filtered.slice(0, Math.floor(n));
+  for (const col of columns) {
+    if (col.id.startsWith("formula.")) {
+      const problem = formulas.problem(col.id.slice(8));
+      if (problem) warn(`${col.id}: ${problem.message} (column left empty)`);
+    } else if (!isKnownPropertyId(col.id)) {
+      warn(`${col.id}: unknown file property (column left empty)`);
     }
   }
 
-  const columns = viewDef.columns;
-  const rows = filtered.map((entry) => projectRow(entry, columns));
-  return { rows, total };
-}
+  // ---- evaluation ----
+  const deadline = Date.now() + (opts.timeLimitMs ?? DEFAULT_TIME_LIMIT_MS);
+  let steps = 0;
+  const tick = () => {
+    if ((++steps & 1023) === 0 && Date.now() > deadline) {
+      throw new ResourceLimitError(
+        `Evaluating this base took longer than ${Math.round((opts.timeLimitMs ?? DEFAULT_TIME_LIMIT_MS) / 1000)}s. Add a filter or a limit to the view.`,
+      );
+    }
+  };
+  const now = opts.now ?? new Date();
+  const links = linkResolver(app);
+  const entries = collectEntries(app);
+  const contexts = entries.map((entry) => makeContext(entry, formulas, links, now, warn, tick));
 
-function collectEntries(app: App): BaseEntry[] {
-  const files = app.vault.getMarkdownFiles();
-  const entries: BaseEntry[] = [];
-  for (const f of files) {
-    entries.push(buildEntry(app, f));
+  let matched = contexts.filter((ctx) => {
+    tick();
+    return evalFilter(globalFilter, ctx) && evalFilter(viewFilter, ctx);
+  });
+
+  let groups: BaseGroup[] | undefined;
+  if (group) {
+    let ordered: Array<{ value: unknown; items: EvalContext[] }> = [];
+    for (const ctx of matched) {
+      tick();
+      const value = normaliseGroupValue(propertyValue(group.property, ctx));
+      let bucket = ordered.find((g) => sameGroup(g.value, value));
+      if (!bucket) {
+        bucket = { value, items: [] };
+        ordered.push(bucket);
+      }
+      bucket.items.push(ctx);
+    }
+    if (Array.isArray(view.groupOrder)) {
+      // Only the listed groups, in that order. `null` = files with no value.
+      const out: typeof ordered = [];
+      for (const want of view.groupOrder) {
+        const hit = ordered.find((g) => sameGroup(g.value, normaliseGroupValue(want)));
+        if (hit && !out.includes(hit)) out.push(hit);
+      }
+      ordered = out;
+    } else {
+      ordered.sort((a, b) => compareSortValues(a.value, b.value, group.dir));
+    }
+    for (const g of ordered) g.items = sortContexts(g.items, sortKeys, tick);
+    groups = ordered.map((g) => ({ value: toOutput(g.value), count: g.items.length }));
+    matched = ordered.flatMap((g) => g.items);
+  } else {
+    matched = sortContexts(matched, sortKeys, tick);
   }
-  return entries;
+
+  const total = matched.length;
+  const limit = readLimit(view.limit);
+  if (limit !== null) matched = matched.slice(0, limit);
+
+  const rows = matched.map((ctx) => projectRow(ctx, columns, formulas, warn));
+
+  const result: EvaluateResult = { view: viewName, rows, total };
+  if (group) {
+    result.groupBy = group.property;
+    result.groups = groups;
+  }
+  if (warnings.size > 0) result.warnings = [...warnings];
+  return result;
 }
 
-function buildEntry(app: App, file: TFile): BaseEntry {
-  const cache = app.metadataCache.getFileCache(file);
-  const frontmatter = cache?.frontmatter
-    ? stripPosition(cache.frontmatter)
-    : {};
-  const cacheTags = cache?.tags?.map((t) => t.tag) ?? [];
-  const fmTags = extractFmTags(frontmatter);
-  const tags = unique([...cacheTags, ...fmTags]);
-  const parentPath = file.parent?.path ?? "";
+// ---------------------------------------------------------------------------
+// YAML and views
+// ---------------------------------------------------------------------------
+
+function parseBaseYaml(yaml: string): Record<string, unknown> {
+  let parsed: unknown;
+  try {
+    parsed = parseYaml(yaml.replace(/^﻿/, ""));
+  } catch (err) {
+    // Only the first line: YAML errors continue with a snippet of the file.
+    const first = (err instanceof Error ? err.message : String(err)).split("\n")[0]!.slice(0, 200);
+    throw new BaseEvaluationError(`Invalid .base YAML: ${first}`);
+  }
+  // An empty file is a valid base: every file, one default view.
+  if (parsed === null || parsed === undefined) return {};
+  if (typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new BaseEvaluationError("A `.base` file must be a YAML mapping (filters, formulas, views, ...).");
+  }
+  return parsed as Record<string, unknown>;
+}
+
+function pickView(views: unknown, requested: string | undefined): { name: string | null; def: ViewDefinition } {
+  const list: Array<{ name: string; def: ViewDefinition }> = [];
+  if (Array.isArray(views)) {
+    views.forEach((v, i) => {
+      if (v && typeof v === "object" && !Array.isArray(v)) {
+        const def = v as ViewDefinition;
+        const name = typeof def.name === "string" && def.name !== "" ? def.name : `View ${i + 1}`;
+        list.push({ name, def });
+      }
+    });
+  } else if (views && typeof views === "object") {
+    // Legacy: a map keyed by view name.
+    for (const [name, def] of Object.entries(views as Record<string, unknown>)) {
+      list.push({ name, def: def && typeof def === "object" ? (def as ViewDefinition) : {} });
+    }
+  } else if (views !== undefined && views !== null) {
+    throw new BaseEvaluationError("`views:` must be a list of views.");
+  }
+
+  if (requested === undefined || requested === "") {
+    if (list.length === 0) return { name: null, def: {} };
+    return list[0]!;
+  }
+  const exact = list.find((v) => v.name === requested);
+  if (exact) return exact;
+  const folded = list.filter((v) => v.name.toLowerCase() === requested.toLowerCase());
+  if (folded.length === 1) return folded[0]!;
+  throw new BaseEvaluationError(
+    `View '${requested}' not found in .base file. Available views: ${
+      list.map((v) => `'${v.name}'`).join(", ") || "(none)"
+    }.`,
+  );
+}
+
+function readLimit(raw: unknown): number | null {
+  if (raw === undefined || raw === null || raw === "") return null;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < 0) return null;
+  return Math.floor(n);
+}
+
+// ---------------------------------------------------------------------------
+// Formulas
+// ---------------------------------------------------------------------------
+
+interface CompiledFormulas {
+  node(name: string): Node | undefined;
+  /** The error a use of this formula would raise, or null if it can be evaluated. */
+  problem(name: string): Error | null;
+}
+
+/**
+ * Parse every formula up front and work out, statically, which ones can't be
+ * evaluated — because they use an unsupported construct, don't parse, refer
+ * to a missing or broken formula, are circular, or chain too deeply.
+ */
+function compileFormulas(raw: unknown): CompiledFormulas {
+  const sources = new Map<string, string>();
+  if (raw !== undefined && raw !== null) {
+    if (typeof raw !== "object" || Array.isArray(raw)) {
+      throw new BaseEvaluationError("`formulas:` must map formula names to expressions.");
+    }
+    for (const [name, expr] of Object.entries(raw as Record<string, unknown>)) {
+      if (typeof expr === "string") sources.set(name, expr);
+      else if (typeof expr === "number" || typeof expr === "boolean") sources.set(name, String(expr));
+    }
+  }
+  const nodes = new Map<string, Node>();
+  const own = new Map<string, Error>();
+  for (const [name, src] of sources) {
+    try {
+      nodes.set(name, parseExpression(src));
+    } catch (err) {
+      if (err instanceof UnsupportedConstructError || err instanceof BaseEvaluationError) {
+        own.set(name, prefixError(err, `formula '${name}'`));
+      } else throw err;
+    }
+  }
+
+  // Iterative post-order walk (no recursion, so a 5,000-formula chain can't
+  // overflow the stack): each formula's problem and chain height.
+  const problems = new Map<string, Error | null>();
+  const height = new Map<string, number>();
+  const state = new Map<string, "visiting" | "done">();
+  const depsOf = (name: string): string[] => {
+    const node = nodes.get(name);
+    return node ? [...formulaRefs(node)] : [];
+  };
+  const finish = (name: string): void => {
+    let problem: Error | null = own.get(name) ?? null;
+    let h = 1;
+    for (const dep of depsOf(name)) {
+      if (!sources.has(dep)) {
+        problem ??= new BaseEvaluationError(`Formula '${name}' uses formula '${dep}', which is not defined in the base's \`formulas:\` section.`);
+        continue;
+      }
+      problem ??= problems.get(dep) ?? null;
+      h = Math.max(h, (height.get(dep) ?? 1) + 1);
+    }
+    if (!problem && h > MAX_FORMULA_DEPTH) {
+      problem = new ResourceLimitError(`Formula '${name}' is built on other formulas more than ${MAX_FORMULA_DEPTH} levels deep.`);
+    }
+    height.set(name, h);
+    problems.set(name, problem);
+    state.set(name, "done");
+  };
+  for (const root of sources.keys()) {
+    if (state.get(root) === "done") continue;
+    const stack: Array<{ name: string; deps: string[]; i: number }> = [{ name: root, deps: depsOf(root), i: 0 }];
+    state.set(root, "visiting");
+    while (stack.length > 0) {
+      const top = stack[stack.length - 1]!;
+      if (top.i < top.deps.length) {
+        const dep = top.deps[top.i++]!;
+        if (!sources.has(dep) || state.get(dep) === "done") continue;
+        if (state.get(dep) === "visiting") {
+          // A cycle: every formula on it is circular.
+          const cycleStart = stack.findIndex((f) => f.name === dep);
+          const cycle = stack.slice(cycleStart).map((f) => f.name);
+          for (const n of cycle) {
+            if (!own.has(n)) own.set(n, new BaseEvaluationError(`Formula '${n}' refers to itself (circular formulas: ${[...cycle, dep].join(" → ")}).`));
+          }
+          continue;
+        }
+        state.set(dep, "visiting");
+        stack.push({ name: dep, deps: depsOf(dep), i: 0 });
+        continue;
+      }
+      stack.pop();
+      finish(top.name);
+    }
+  }
+
+  return {
+    node: (name) => nodes.get(name),
+    problem: (name) =>
+      sources.has(name)
+        ? (problems.get(name) ?? null)
+        : new BaseEvaluationError(`Formula '${name}' is not defined in the base's \`formulas:\` section.`),
+  };
+}
+
+function prefixError(err: Error, where: string): Error {
+  const msg = `In ${where}: ${err.message}`;
+  if (err instanceof UnsupportedConstructError) return new UnsupportedConstructError(msg);
+  if (err instanceof ResourceLimitError) return new ResourceLimitError(msg);
+  return new BaseEvaluationError(msg);
+}
+
+// ---------------------------------------------------------------------------
+// Entries
+// ---------------------------------------------------------------------------
+
+/** Every file in the vault — a base isn't limited to notes. */
+function collectEntries(app: App): BaseEntry[] {
+  const vault = app.vault as App["vault"] & { getFiles?: () => TFile[] };
+  const files = typeof vault.getFiles === "function" ? vault.getFiles() : app.vault.getMarkdownFiles();
+  const typeOf = propertyTypes(app);
+  return files.map((f) => buildEntry(app, f, typeOf));
+}
+
+/**
+ * The type Obsidian assigned to a property (Settings → Properties), via the
+ * undocumented `app.metadataTypeManager`. Null when unknown.
+ */
+function propertyTypes(app: App): (name: string) => string | null {
+  const mtm = (app as App & {
+    metadataTypeManager?: {
+      getAssignedType?: (name: string) => unknown;
+      types?: Record<string, { type?: unknown } | undefined>;
+      properties?: Record<string, { type?: unknown } | undefined>;
+    };
+  }).metadataTypeManager;
+  if (!mtm) return () => null;
+  const cache = new Map<string, string | null>();
+  return (name) => {
+    const key = name.toLowerCase();
+    if (cache.has(key)) return cache.get(key)!;
+    let type: string | null = null;
+    try {
+      const assigned = typeof mtm.getAssignedType === "function" ? mtm.getAssignedType(name) : undefined;
+      if (typeof assigned === "string") type = assigned;
+      else {
+        const t = (mtm.types && Object.prototype.hasOwnProperty.call(mtm.types, key) ? mtm.types[key]?.type : undefined) ??
+          (mtm.properties && Object.prototype.hasOwnProperty.call(mtm.properties, key) ? mtm.properties[key]?.type : undefined);
+        if (typeof t === "string") type = t;
+      }
+    } catch {
+      type = null;
+    }
+    cache.set(key, type);
+    return type;
+  };
+}
+
+function buildEntry(app: App, file: TFile, typeOf: (name: string) => string | null): BaseEntry {
+  const isMd = file.extension === "md";
+  const cache = (isMd ? app.metadataCache.getFileCache(file) : null) as
+    | (CachedMetadata & { frontmatterLinks?: Array<{ link: string }> })
+    | null;
+  const note: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(cache?.frontmatter ?? {})) {
+    note[k] = typedValue(v, typeOf(k));
+  }
+  const tags = cache ? unique(getAllTags(cache) ?? []) : [];
+  const links = unique([...(cache?.links ?? []), ...(cache?.frontmatterLinks ?? [])].map((l) => l.link));
+  const embeds = unique((cache?.embeds ?? []).map((l) => l.link));
+  const name = (file as TFile & { name?: string }).name ?? `${file.basename}.${file.extension}`;
   return {
     file: {
-      name: file.basename,
+      name,
+      basename: file.basename,
       path: file.path,
-      folder: parentPath === "/" ? "" : parentPath,
+      // Obsidian's root folder path is "/".
+      folder: file.parent?.path ?? "/",
       ext: file.extension,
       size: file.stat.size,
       mtime: file.stat.mtime,
       ctime: file.stat.ctime,
       tags,
+      links,
+      embeds,
     },
-    frontmatter,
+    note,
   };
 }
 
-function stripPosition(fm: Record<string, unknown>): Record<string, unknown> {
-  const out: Record<string, unknown> = {};
-  for (const [k, v] of Object.entries(fm)) {
-    if (k === "position") continue;
-    out[k] = v;
+/** Date / datetime-typed properties become dates, as Bases sees them. */
+function typedValue(v: unknown, type: string | null): unknown {
+  if ((type === "date" || type === "datetime") && typeof v === "string") {
+    const d = asDate(v);
+    if (!d) return v;
+    if (type === "date") {
+      const day = new Date(d.getFullYear(), d.getMonth(), d.getDate());
+      return markDateOnly(day);
+    }
+    return new Date(d.getTime());
   }
-  return out;
-}
-
-function extractFmTags(fm: Record<string, unknown>): string[] {
-  const raw = (fm as { tags?: unknown; tag?: unknown }).tags ??
-    (fm as { tag?: unknown }).tag;
-  if (raw === undefined || raw === null) return [];
-  const arr = Array.isArray(raw) ? raw : [raw];
-  const out: string[] = [];
-  for (const t of arr) {
-    if (typeof t !== "string") continue;
-    out.push(t.startsWith("#") ? t : `#${t}`);
-  }
-  return out;
+  return v;
 }
 
 function unique<T>(arr: T[]): T[] {
   return Array.from(new Set(arr));
 }
 
-/**
- * Evaluate a filter node against one entry.
- *
- * Supported filter shapes:
- *   - Tree op object: `{and: [...]}`, `{or: [...]}`, `{not: {...}}`.
- *   - Comparison object on a path: `{fm.rating: {">=": 4}}` — the single key
- *     is the left-hand path (file.name, frontmatter.x, bare x). The value is
- *     a single-key comparison map.
- *   - Leaf expression string: `file.hasTag("book")`, `file.inFolder("x")`,
- *     `foo && bar`, `!foo`, `a == "x"`, `a.b != null`.
- */
-function evalFilter(node: unknown, entry: BaseEntry): boolean {
-  if (node === null || node === undefined) return true;
-  if (typeof node === "boolean") return node;
-  if (typeof node === "string") return Boolean(evalLeafExpr(node, entry));
-
-  if (Array.isArray(node)) {
-    // A bare array at this level is ambiguous — Bases uses object keys for
-    // tree ops. Reject to keep the contract clean.
-    throw new UnsupportedConstructError(
-      `Unsupported construct: raw array in filter context. Use '{and: [...]}' or '{or: [...]}' explicitly. Supported v1.4.0 constructs: ${SUPPORTED_CONSTRUCTS}.`,
-    );
-  }
-
-  if (typeof node === "object") {
-    const obj = node as Record<string, unknown>;
-    const keys = Object.keys(obj);
-    if (keys.length === 0) return true;
-
-    // Tree-op keys may coexist with siblings? Bases' own schema treats a
-    // filter object with an `and` key as the tree op — we do the same.
-    if ("and" in obj) {
-      const list = obj["and"];
-      if (!Array.isArray(list)) {
-        throw new BaseEvaluationError(
-          "`and:` must be a list of filter nodes.",
-        );
+function linkResolver(app: App): LinkResolver {
+  const mc = app.metadataCache as App["metadataCache"] & {
+    resolvedLinks?: Record<string, Record<string, number>>;
+  };
+  let reverse: Map<string, string[]> | null = null;
+  return {
+    resolve(linkpath, sourcePath) {
+      const f = typeof mc.getFirstLinkpathDest === "function" ? mc.getFirstLinkpathDest(linkpath, sourcePath) : null;
+      return f ? f.path : null;
+    },
+    linksTo(sourcePath, targetPath) {
+      const out = mc.resolvedLinks && Object.prototype.hasOwnProperty.call(mc.resolvedLinks, sourcePath) ? mc.resolvedLinks[sourcePath] : undefined;
+      return !!out && Object.prototype.hasOwnProperty.call(out, targetPath) && (out[targetPath] ?? 0) > 0;
+    },
+    backlinks(targetPath) {
+      if (reverse === null) {
+        reverse = new Map();
+        for (const [src, targets] of Object.entries(mc.resolvedLinks ?? {})) {
+          for (const t of Object.keys(targets)) {
+            const list = reverse.get(t) ?? [];
+            list.push(src);
+            reverse.set(t, list);
+          }
+        }
       }
-      for (const item of list) {
-        if (!evalFilter(item, entry)) return false;
-      }
-      return true;
-    }
-    if ("or" in obj) {
-      const list = obj["or"];
-      if (!Array.isArray(list)) {
-        throw new BaseEvaluationError(
-          "`or:` must be a list of filter nodes.",
-        );
-      }
-      for (const item of list) {
-        if (evalFilter(item, entry)) return true;
-      }
-      return false;
-    }
-    if ("not" in obj) {
-      return !evalFilter(obj["not"], entry);
-    }
-
-    // Otherwise treat each key as a path → comparison map (AND them).
-    for (const path of keys) {
-      const rhs = obj[path];
-      if (!evalPathComparison(path, rhs, entry)) return false;
-    }
-    return true;
-  }
-
-  throw new UnsupportedConstructError(
-    `Unsupported construct: filter value of type '${typeof node}'. Supported v1.4.0 constructs: ${SUPPORTED_CONSTRUCTS}.`,
-  );
+      return (reverse.get(targetPath) ?? []).slice();
+    },
+  };
 }
 
-function evalPathComparison(
-  path: string,
-  rhs: unknown,
+// ---------------------------------------------------------------------------
+// Per-entry context and property ids
+// ---------------------------------------------------------------------------
+
+function makeContext(
   entry: BaseEntry,
-): boolean {
-  if (rhs !== null && typeof rhs === "object" && !Array.isArray(rhs)) {
-    const cmpObj = rhs as Record<string, unknown>;
-    const cmpKeys = Object.keys(cmpObj);
-    if (cmpKeys.length !== 1 || !COMPARISON_OPS.has(cmpKeys[0]!)) {
-      throw new UnsupportedConstructError(
-        `Unsupported construct: comparison value '${JSON.stringify(rhs)}' on path '${path}'. Supported v1.4.0 constructs: ${SUPPORTED_CONSTRUCTS}.`,
-      );
-    }
-    const op = cmpKeys[0]!;
-    const lhs = resolvePath(path, entry);
-    return compare(lhs, op, cmpObj[op]);
-  }
-  // Shorthand: `status: reading` is `status == reading`.
-  const lhs = resolvePath(path, entry);
-  return compare(lhs, "==", rhs);
+  formulas: CompiledFormulas,
+  links: LinkResolver,
+  now: Date,
+  warn: (msg: string) => void,
+  tick: () => void,
+): EvalContext {
+  const memo = new Map<string, unknown>();
+  const active = new Set<string>();
+  const ctx: EvalContext = {
+    entry,
+    links,
+    now,
+    warn,
+    tick,
+    formula(name) {
+      if (memo.has(name)) return memo.get(name);
+      const problem = formulas.problem(name);
+      if (problem) throw problem;
+      if (active.has(name)) throw new BaseEvaluationError(`Formula '${name}' refers to itself (circular formulas).`);
+      active.add(name);
+      try {
+        const value = evaluate(formulas.node(name)!, ctx);
+        memo.set(name, value);
+        return value;
+      } finally {
+        active.delete(name);
+      }
+    },
+  };
+  return ctx;
 }
 
-function compare(lhs: unknown, op: string, rhs: unknown): boolean {
-  switch (op) {
-    case "==":
-      return equals(lhs, rhs);
-    case "!=":
-      return !equals(lhs, rhs);
-    case ">":
-      return cmpOrder(lhs, rhs) > 0;
-    case ">=":
-      return cmpOrder(lhs, rhs) >= 0;
-    case "<":
-      return cmpOrder(lhs, rhs) < 0;
-    case "<=":
-      return cmpOrder(lhs, rhs) <= 0;
-    default:
-      throw new UnsupportedConstructError(
-        `Unsupported construct: comparison operator '${op}'. Supported v1.4.0 constructs: ${SUPPORTED_CONSTRUCTS}.`,
-      );
-  }
+function isKnownPropertyId(id: string): boolean {
+  return !id.startsWith("file.") || FILE_FIELDS.has(id.slice(5));
 }
 
-function equals(a: unknown, b: unknown): boolean {
-  if (a === b) return true;
-  if (typeof a === "number" && typeof b === "number")
-    return Number.isNaN(a) && Number.isNaN(b) ? false : a === b;
-  if (
-    (typeof a === "string" || typeof a === "number" || typeof a === "boolean") &&
-    (typeof b === "string" || typeof b === "number" || typeof b === "boolean")
-  ) {
-    return String(a) === String(b);
+function checkPropertyId(id: string, where: string): void {
+  if (!isKnownPropertyId(id)) {
+    throw new UnsupportedConstructError(`Unsupported construct: unknown file property '${id}' in ${where}.`);
   }
-  return false;
-}
-
-function cmpOrder(a: unknown, b: unknown): number {
-  if (typeof a === "number" && typeof b === "number") return a - b;
-  if (a instanceof Date && b instanceof Date) return a.getTime() - b.getTime();
-  const as = String(a ?? "");
-  const bs = String(b ?? "");
-  if (as < bs) return -1;
-  if (as > bs) return 1;
-  return 0;
 }
 
 /**
- * Resolve a dot-path against an entry. Supports:
- *   - file.name, file.path, file.folder, file.ext, file.size, file.mtime, file.ctime, file.tags
- *   - frontmatter.key, frontmatter.key.nested
- *   - bare key (defaults to frontmatter.key)
+ * Value of a property id as used in `order`, `sort` and `groupBy`:
+ * `file.<field>`, `formula.<name>`, `note.<name>`, a bare note property
+ * name (which may contain spaces), or legacy `frontmatter.<name>` /
+ * `a.b.c` dot paths into nested frontmatter.
  */
-export function resolvePath(path: string, entry: BaseEntry): unknown {
-  if (!path || typeof path !== "string") return undefined;
-  const segments = path.split(".");
-  let base: unknown;
-  if (segments[0] === "file") {
-    base = entry.file;
-    segments.shift();
-  } else if (segments[0] === "frontmatter") {
-    base = entry.frontmatter;
-    segments.shift();
-  } else {
-    base = entry.frontmatter;
-  }
-  let cur: unknown = base;
-  for (const seg of segments) {
-    if (cur === null || cur === undefined) return undefined;
-    if (typeof cur !== "object") return undefined;
+export function propertyValue(id: string, ctx: EvalContext): unknown {
+  if (id.startsWith("file.")) return fileField(ctx.entry, id.slice(5), ctx);
+  if (id.startsWith("formula.")) return ctx.formula(id.slice(8));
+  let name = id;
+  if (id.startsWith("note.")) name = id.slice(5);
+  else if (id.startsWith("frontmatter.")) name = id.slice(12);
+  const note = ctx.entry.note;
+  if (Object.prototype.hasOwnProperty.call(note, name)) return note[name] ?? null;
+  // Nested dot path (`author.name`).
+  let cur: unknown = note;
+  for (const seg of name.split(".")) {
+    if (cur === null || typeof cur !== "object" || Array.isArray(cur) || cur instanceof Date) return null;
+    if (!Object.prototype.hasOwnProperty.call(cur, seg)) return null;
     cur = (cur as Record<string, unknown>)[seg];
   }
-  return cur;
+  return cur === undefined ? null : cur;
+}
+
+// ---------------------------------------------------------------------------
+// Filters
+// ---------------------------------------------------------------------------
+
+/** A filter tree compiled once from YAML; `null` means "no condition". */
+type Filter =
+  | null
+  | { k: "expr"; node: Node }
+  | { k: "and" | "or" | "not"; items: Filter[] }
+  | { k: "legacy"; path: string; op: string; value: unknown };
+
+const GROUP_KEYS = ["and", "or", "not"] as const;
+const LEGACY_OPS = new Set(["==", "!=", ">", ">=", "<", "<="]);
+
+function isScalar(v: unknown): boolean {
+  return v === null || typeof v === "string" || typeof v === "number" || typeof v === "boolean";
 }
 
 /**
- * Evaluate a leaf expression string. Whitelist grammar:
+ * Compile a `filters:` tree. Rejects cyclic YAML (a recursive anchor), trees
+ * too big or deep to evaluate, and keys that aren't `and` / `or` / `not` or
+ * the legacy `{property: value}` shorthand.
  *
- *   expr     := or
- *   or       := and ("||" and)*
- *   and      := not ("&&" not)*
- *   not      := "!" atom | atom
- *   atom     := comparison | call | path
- *   call     := "file.hasTag" "(" STRING ")" | "file.inFolder" "(" STRING ")"
- *   comparison := path OP literal    // OP ∈ ==, !=, >, >=, <, <=
- *   path     := IDENT ("." IDENT)*
- *   literal  := STRING | NUMBER | "true" | "false" | "null"
- *
- * Anything outside this grammar — arithmetic, other method calls, function
- * calls, regex — throws `UnsupportedConstructError` naming the fragment.
+ * An empty group (`and: []`, `not:` with nothing under it) is "no
+ * condition", which holds for every file, in place: inside `and` it changes
+ * nothing, inside `or` it makes the `or` hold, inside `not` it excludes
+ * nothing, and at the top level it means no filter. `null` stands for it.
  */
-export function evalLeafExpr(src: string, entry: BaseEntry): unknown {
-  rejectForbiddenFragments(src);
-  const tokens = tokenize(src);
-  const parser = { tokens, pos: 0 };
-  const value = parseOr(parser, src, entry);
-  if (parser.pos < parser.tokens.length) {
-    const tok = parser.tokens[parser.pos]!;
-    throw new UnsupportedConstructError(
-      `Unsupported construct: trailing token '${tok.raw}' in '${src}'. Supported v1.4.0 constructs: ${SUPPORTED_CONSTRUCTS}.`,
-    );
-  }
-  return value;
-}
-
-function rejectForbiddenFragments(src: string): void {
-  // Arithmetic operators — catch before tokenising so the message has context.
-  const arithMatch = src.match(/(?:^|[^=!<>])([+\-*/%])(?!=)/);
-  if (arithMatch) {
-    const op = arithMatch[1]!;
-    throw new UnsupportedConstructError(
-      `Unsupported construct: arithmetic '${op}' in '${src}'. Supported v1.4.0 constructs: ${SUPPORTED_CONSTRUCTS}. Arithmetic ships in v1.4.1.`,
-    );
-  }
-  // Regex literal — /.../flags with .matches(...) tail etc.
-  if (/\/[^/\n]*\/[gimsy]*\b/.test(src)) {
-    throw new UnsupportedConstructError(
-      `Unsupported construct: regex literal in '${src}'. Supported v1.4.0 constructs: ${SUPPORTED_CONSTRUCTS}. Regex ships in a later v1.4.x patch.`,
-    );
-  }
-  // `this` context.
-  if (/\bthis\b/.test(src)) {
-    throw new UnsupportedConstructError(
-      `Unsupported construct: 'this' context reference in '${src}'. Supported v1.4.0 constructs: ${SUPPORTED_CONSTRUCTS}.`,
-    );
-  }
-  // Unsupported method calls: any `.foo(` except the two whitelisted ones.
-  // We match `.IDENT(` tail patterns and reject unknowns.
-  const methodRe = /\.([A-Za-z_][A-Za-z0-9_]*)\s*\(/g;
-  let m: RegExpExecArray | null;
-  while ((m = methodRe.exec(src)) !== null) {
-    const name = m[1]!;
-    if (name === "hasTag" || name === "inFolder") {
-      // Further-restrict: only allowed as `file.hasTag(...)` / `file.inFolder(...)`.
-      const before = src.slice(0, m.index);
-      if (!/\bfile$/.test(before)) {
-        throw new UnsupportedConstructError(
-          `Unsupported construct: method call '.${name}(' on a non-'file' receiver in '${src}'. Only 'file.hasTag(...)' and 'file.inFolder(...)' are supported in v1.4.0. Supported v1.4.0 constructs: ${SUPPORTED_CONSTRUCTS}.`,
-        );
+function compileFilter(raw: unknown, where: string, warn: (msg: string) => void): Filter {
+  let count = 0;
+  const onPath = new Set<object>();
+  const walk = (node: unknown, depth: number): Filter => {
+    if (++count > MAX_FILTER_NODES) {
+      throw new ResourceLimitError(`\`${where}\` has more than ${MAX_FILTER_NODES.toLocaleString("en")} conditions (counting YAML aliases).`);
+    }
+    if (depth > MAX_FILTER_DEPTH) {
+      throw new ResourceLimitError(`\`${where}\` nests and/or/not groups more than ${MAX_FILTER_DEPTH} deep.`);
+    }
+    if (node === null || node === undefined) return null;
+    if (typeof node === "boolean") return node ? null : { k: "expr", node: parseExpression("false") };
+    if (typeof node === "string") return node.trim() === "" ? null : { k: "expr", node: parseExpression(node) };
+    if (typeof node === "number") return { k: "expr", node: parseExpression(String(node)) };
+    if (typeof node !== "object") throw new BaseEvaluationError(`Invalid filter in \`${where}\`: ${JSON.stringify(node)}.`);
+    if (onPath.has(node)) throw new BaseEvaluationError(`\`${where}\` refers to itself (a recursive YAML anchor).`);
+    onPath.add(node);
+    try {
+      if (Array.isArray(node)) return group("and", node, depth);
+      const obj = node as Record<string, unknown>;
+      const keys = Object.keys(obj);
+      const groupKeys = keys.filter((k) => (GROUP_KEYS as readonly string[]).includes(k));
+      if (groupKeys.length > 1) {
+        throw new BaseEvaluationError(`A filter group in \`${where}\` can use only one of and / or / not (found ${groupKeys.join(", ")}).`);
       }
-      continue;
-    }
-    throw new UnsupportedConstructError(
-      `Unsupported construct: method call '.${name}(' in '${src}'. Only 'file.hasTag(...)' and 'file.inFolder(...)' are supported in v1.4.0. Supported v1.4.0 constructs: ${SUPPORTED_CONSTRUCTS}.`,
-    );
-  }
-  // Bare function calls at line start (no `.` before) — today(), now(), etc.
-  const callRe = /(?:^|[^.\w])([A-Za-z_][A-Za-z0-9_]*)\s*\(/g;
-  let c: RegExpExecArray | null;
-  while ((c = callRe.exec(src)) !== null) {
-    const name = c[1]!;
-    if (name === "file") continue; // part of `file.hasTag(...)`.
-    throw new UnsupportedConstructError(
-      `Unsupported construct: function call '${name}(' in '${src}'. Supported v1.4.0 constructs: ${SUPPORTED_CONSTRUCTS}. Functions ship in later v1.4.x patches.`,
-    );
-  }
-}
-
-interface Token {
-  kind:
-    | "ident"
-    | "dot"
-    | "string"
-    | "number"
-    | "lparen"
-    | "rparen"
-    | "op"
-    | "and"
-    | "or"
-    | "not"
-    | "keyword";
-  raw: string;
-  value?: string | number | boolean | null;
-}
-
-function tokenize(src: string): Token[] {
-  const toks: Token[] = [];
-  let i = 0;
-  const n = src.length;
-  while (i < n) {
-    const ch = src[i]!;
-    if (/\s/.test(ch)) {
-      i++;
-      continue;
-    }
-    if (ch === "(") {
-      toks.push({ kind: "lparen", raw: ch });
-      i++;
-      continue;
-    }
-    if (ch === ")") {
-      toks.push({ kind: "rparen", raw: ch });
-      i++;
-      continue;
-    }
-    if (ch === "." && /[A-Za-z_]/.test(src[i + 1] ?? "")) {
-      toks.push({ kind: "dot", raw: "." });
-      i++;
-      continue;
-    }
-    if (ch === "&" && src[i + 1] === "&") {
-      toks.push({ kind: "and", raw: "&&" });
-      i += 2;
-      continue;
-    }
-    if (ch === "|" && src[i + 1] === "|") {
-      toks.push({ kind: "or", raw: "||" });
-      i += 2;
-      continue;
-    }
-    if (ch === "!") {
-      if (src[i + 1] === "=") {
-        toks.push({ kind: "op", raw: "!=" });
-        i += 2;
-        continue;
+      if (groupKeys.length === 1) {
+        const key = groupKeys[0] as "and" | "or" | "not";
+        for (const extra of keys) if (extra !== key) warn(`Ignored unknown key '${extra}' in a filter group in \`${where}\`.`);
+        const v = obj[key];
+        const items = v === null || v === undefined ? [] : Array.isArray(v) ? v : [v];
+        return group(key, items, depth);
       }
-      toks.push({ kind: "not", raw: "!" });
-      i++;
-      continue;
-    }
-    if (ch === "=" && src[i + 1] === "=") {
-      toks.push({ kind: "op", raw: "==" });
-      i += 2;
-      continue;
-    }
-    if (ch === ">" || ch === "<") {
-      if (src[i + 1] === "=") {
-        toks.push({ kind: "op", raw: ch + "=" });
-        i += 2;
-        continue;
-      }
-      toks.push({ kind: "op", raw: ch });
-      i++;
-      continue;
-    }
-    if (ch === '"' || ch === "'") {
-      const quote = ch;
-      let j = i + 1;
-      let buf = "";
-      while (j < n && src[j] !== quote) {
-        if (src[j] === "\\" && j + 1 < n) {
-          buf += src[j + 1];
-          j += 2;
+      if (keys.length === 0) return null;
+      // Legacy shorthand: `{status: reading}` / `{rating: {">=": 4}}`.
+      const legacy: Filter[] = [];
+      for (const key of keys) {
+        const v = obj[key];
+        if (typeof v === "string" && looksLikeExpression(v)) {
+          // `nor: 'status == 5'` is a misspelt group, not "nor equals ...".
+          throw unknownKey(key, where);
+        }
+        if (isScalar(v)) {
+          legacy.push({ k: "legacy", path: key, op: "==", value: v });
           continue;
         }
-        buf += src[j];
-        j++;
-      }
-      if (j >= n) {
-        throw new BaseEvaluationError(
-          `Unterminated string literal in expression '${src}'.`,
-        );
-      }
-      toks.push({ kind: "string", raw: src.slice(i, j + 1), value: buf });
-      i = j + 1;
-      continue;
-    }
-    if (/[0-9]/.test(ch) || (ch === "-" && /[0-9]/.test(src[i + 1] ?? ""))) {
-      let j = i + 1;
-      while (j < n && /[0-9.]/.test(src[j]!)) j++;
-      const raw = src.slice(i, j);
-      toks.push({ kind: "number", raw, value: Number(raw) });
-      i = j;
-      continue;
-    }
-    if (/[A-Za-z_]/.test(ch)) {
-      let j = i + 1;
-      while (j < n && /[A-Za-z0-9_]/.test(src[j]!)) j++;
-      const raw = src.slice(i, j);
-      if (raw === "true" || raw === "false") {
-        toks.push({ kind: "keyword", raw, value: raw === "true" });
-      } else if (raw === "null") {
-        toks.push({ kind: "keyword", raw, value: null });
-      } else {
-        toks.push({ kind: "ident", raw });
-      }
-      i = j;
-      continue;
-    }
-    throw new UnsupportedConstructError(
-      `Unsupported construct: unexpected character '${ch}' in '${src}'. Supported v1.4.0 constructs: ${SUPPORTED_CONSTRUCTS}.`,
-    );
-  }
-  return toks;
-}
-
-interface Parser {
-  tokens: Token[];
-  pos: number;
-}
-
-function peek(p: Parser): Token | undefined {
-  return p.tokens[p.pos];
-}
-
-function consume(p: Parser): Token | undefined {
-  return p.tokens[p.pos++];
-}
-
-function parseOr(p: Parser, src: string, entry: BaseEntry): unknown {
-  let left = parseAnd(p, src, entry);
-  while (peek(p)?.kind === "or") {
-    consume(p);
-    const right = parseAnd(p, src, entry);
-    left = Boolean(left) || Boolean(right);
-  }
-  return left;
-}
-
-function parseAnd(p: Parser, src: string, entry: BaseEntry): unknown {
-  let left = parseNot(p, src, entry);
-  while (peek(p)?.kind === "and") {
-    consume(p);
-    const right = parseNot(p, src, entry);
-    left = Boolean(left) && Boolean(right);
-  }
-  return left;
-}
-
-function parseNot(p: Parser, src: string, entry: BaseEntry): unknown {
-  if (peek(p)?.kind === "not") {
-    consume(p);
-    return !Boolean(parseNot(p, src, entry));
-  }
-  return parseAtom(p, src, entry);
-}
-
-function parseAtom(p: Parser, src: string, entry: BaseEntry): unknown {
-  const tok = peek(p);
-  if (!tok) {
-    throw new BaseEvaluationError(
-      `Unexpected end of expression '${src}'.`,
-    );
-  }
-  if (tok.kind === "lparen") {
-    consume(p);
-    const v = parseOr(p, src, entry);
-    const close = consume(p);
-    if (close?.kind !== "rparen") {
-      throw new BaseEvaluationError(
-        `Expected ')' in expression '${src}'.`,
-      );
-    }
-    return v;
-  }
-  if (
-    tok.kind === "string" ||
-    tok.kind === "number" ||
-    tok.kind === "keyword"
-  ) {
-    consume(p);
-    return tok.value;
-  }
-  if (tok.kind === "ident") {
-    // Build a path: ident ("." ident)*
-    const parts: string[] = [consume(p)!.raw];
-    while (peek(p)?.kind === "dot") {
-      consume(p);
-      const next = consume(p);
-      if (next?.kind !== "ident") {
-        throw new BaseEvaluationError(
-          `Expected identifier after '.' in '${src}'.`,
-        );
-      }
-      parts.push(next.raw);
-    }
-    // Method call?
-    if (peek(p)?.kind === "lparen") {
-      consume(p);
-      const methodPath = parts.join(".");
-      if (methodPath !== "file.hasTag" && methodPath !== "file.inFolder") {
-        throw new UnsupportedConstructError(
-          `Unsupported construct: method call '${methodPath}(' in '${src}'. Only 'file.hasTag(...)' and 'file.inFolder(...)' are supported in v1.4.0. Supported v1.4.0 constructs: ${SUPPORTED_CONSTRUCTS}.`,
-        );
-      }
-      const argTok = consume(p);
-      if (argTok?.kind !== "string") {
-        throw new BaseEvaluationError(
-          `'${methodPath}' requires a single string argument in '${src}'.`,
-        );
-      }
-      const close = consume(p);
-      if (close?.kind !== "rparen") {
-        throw new BaseEvaluationError(
-          `Expected ')' after '${methodPath}(' in '${src}'.`,
-        );
-      }
-      const arg = String(argTok.value ?? "");
-      if (methodPath === "file.hasTag") {
-        return hasTag(entry, arg);
-      }
-      return inFolder(entry, arg);
-    }
-    // Bare path — could be followed by a comparison op.
-    const lhsPath = parts.join(".");
-    const opTok = peek(p);
-    if (opTok?.kind === "op") {
-      consume(p);
-      const rhsTok = consume(p);
-      let rhs: unknown;
-      if (rhsTok?.kind === "string" || rhsTok?.kind === "number" || rhsTok?.kind === "keyword") {
-        rhs = rhsTok.value;
-      } else if (rhsTok?.kind === "ident") {
-        // allow `a == b` where b is treated as a path too
-        const rparts = [rhsTok.raw];
-        while (peek(p)?.kind === "dot") {
-          consume(p);
-          const next = consume(p);
-          if (next?.kind !== "ident") {
-            throw new BaseEvaluationError(
-              `Expected identifier after '.' in '${src}'.`,
-            );
+        if (v && typeof v === "object" && !Array.isArray(v)) {
+          const entries = Object.entries(v as Record<string, unknown>);
+          if (entries.length === 1 && LEGACY_OPS.has(entries[0]![0]) && isScalar(entries[0]![1])) {
+            legacy.push({ k: "legacy", path: key, op: entries[0]![0], value: entries[0]![1] });
+            continue;
           }
-          rparts.push(next.raw);
         }
-        rhs = resolvePath(rparts.join("."), entry);
-      } else {
-        throw new BaseEvaluationError(
-          `Expected literal or path on right side of '${opTok.raw}' in '${src}'.`,
-        );
+        throw unknownKey(key, where);
       }
-      return compare(resolvePath(lhsPath, entry), opTok.raw, rhs);
+      return legacy.length === 1 ? legacy[0]! : { k: "and", items: legacy };
+    } finally {
+      onPath.delete(node);
     }
-    return resolvePath(lhsPath, entry);
-  }
-  throw new UnsupportedConstructError(
-    `Unsupported construct: token '${tok.raw}' in '${src}'. Supported v1.4.0 constructs: ${SUPPORTED_CONSTRUCTS}.`,
+  };
+  const group = (k: "and" | "or" | "not", items: unknown[], depth: number): Filter => {
+    const compiled = items.map((n) => walk(n, depth + 1));
+    // `or` with a member that holds for every file holds for every file.
+    if (k === "or" && compiled.some((f) => f === null)) return null;
+    const conditions = compiled.filter((f) => f !== null);
+    return conditions.length === 0 ? null : { k, items: conditions };
+  };
+  return walk(raw, 0);
+}
+
+function unknownKey(key: string, where: string): BaseEvaluationError {
+  return new BaseEvaluationError(
+    `Unknown filter key '${key}' in \`${where}\`. A filter is an expression string or a group using and, or, or not (lower case).`,
   );
 }
 
-function hasTag(entry: BaseEntry, tag: string): boolean {
-  const normalized = tag.startsWith("#") ? tag : `#${tag}`;
-  return entry.file.tags.some((t) => t === normalized || t === tag);
+/** A value that reads as an expression rather than a property value. */
+function looksLikeExpression(v: string): boolean {
+  return /==|!=|>=|<=|[<>]|&&|\|\||\(/.test(v) || /^\s*!?\s*(file|note|formula|frontmatter)\./.test(v);
 }
 
-function inFolder(entry: BaseEntry, folder: string): boolean {
-  const f = folder.replace(/\/$/, "");
-  if (f === "") return true;
-  return entry.file.folder === f || entry.file.folder.startsWith(f + "/");
+function filterFormulaRefs(f: Filter, out: Set<string>): void {
+  if (f === null) return;
+  if (f.k === "expr") formulaRefs(f.node, out);
+  else if (f.k === "legacy") {
+    if (f.path.startsWith("formula.")) out.add(f.path.slice(8));
+  } else f.items.forEach((i) => filterFormulaRefs(i, out));
 }
 
-function applySort(entries: BaseEntry[], sort: unknown): BaseEntry[] {
-  if (!Array.isArray(sort)) {
-    throw new BaseEvaluationError(
-      "`sort:` must be a list of {column, direction} or bare column strings.",
-    );
+/**
+ * `not` excludes a file if ANY listed condition holds ("None of the
+ * following are true"); `null` (no condition) keeps every file.
+ */
+function evalFilter(f: Filter, ctx: EvalContext): boolean {
+  if (f === null) return true;
+  switch (f.k) {
+    case "expr":
+      return truthy(evaluate(f.node, ctx));
+    case "and":
+      return f.items.every((i) => evalFilter(i, ctx));
+    case "or":
+      return f.items.some((i) => evalFilter(i, ctx));
+    case "not":
+      return !f.items.some((i) => evalFilter(i, ctx));
+    case "legacy": {
+      const lhs = propertyValue(f.path, ctx);
+      if (f.op === "==") return equals(lhs, f.value);
+      if (f.op === "!=") return !equals(lhs, f.value);
+      const c = compareValues(lhs, f.value);
+      if (c === null) return false;
+      return f.op === ">" ? c > 0 : f.op === ">=" ? c >= 0 : f.op === "<" ? c < 0 : c <= 0;
+    }
   }
-  const keys: Array<{ path: string; dir: 1 | -1 }> = [];
-  for (const item of sort) {
-    if (typeof item === "string") {
-      keys.push({ path: item, dir: 1 });
-    } else if (item && typeof item === "object") {
-      const o = item as { column?: unknown; direction?: unknown };
-      if (typeof o.column !== "string") {
-        throw new BaseEvaluationError(
-          "`sort:` item is missing a string 'column'.",
-        );
-      }
-      const dir =
-        typeof o.direction === "string" && /^desc/i.test(o.direction)
-          ? -1
-          : 1;
-      keys.push({ path: o.column, dir });
+}
+
+// ---------------------------------------------------------------------------
+// Sort and group
+// ---------------------------------------------------------------------------
+
+interface SortKey {
+  property: string;
+  dir: 1 | -1;
+}
+
+function direction(raw: unknown): 1 | -1 {
+  return typeof raw === "string" && /^desc/i.test(raw) ? -1 : 1;
+}
+
+function readSort(raw: unknown): SortKey[] {
+  if (raw === undefined || raw === null) return [];
+  const items = Array.isArray(raw) ? raw : [raw];
+  const keys: SortKey[] = [];
+  for (const item of items) {
+    if (typeof item === "string" && item !== "") keys.push({ property: item, dir: 1 });
+    else if (item && typeof item === "object") {
+      const o = item as { property?: unknown; column?: unknown; direction?: unknown };
+      const property = typeof o.property === "string" ? o.property : typeof o.column === "string" ? o.column : null;
+      if (property === null) throw new BaseEvaluationError(`\`sort:\` item ${JSON.stringify(item)} has no \`property\`.`);
+      keys.push({ property, dir: direction(o.direction) });
     } else {
-      throw new BaseEvaluationError(
-        `Invalid sort item: ${JSON.stringify(item)}.`,
-      );
+      throw new BaseEvaluationError(`Invalid \`sort:\` item: ${JSON.stringify(item)}.`);
     }
   }
-  const copy = entries.slice();
-  copy.sort((a, b) => {
-    for (const k of keys) {
-      const av = resolvePath(k.path, a);
-      const bv = resolvePath(k.path, b);
-      const c = cmpOrder(av, bv);
-      if (c !== 0) return c * k.dir;
+  return keys;
+}
+
+function readGroupBy(raw: unknown): SortKey | null {
+  if (raw === undefined || raw === null || raw === "") return null;
+  if (typeof raw === "string") return { property: raw, dir: 1 };
+  if (typeof raw === "object" && !Array.isArray(raw)) {
+    const o = raw as { property?: unknown; direction?: unknown };
+    if (typeof o.property !== "string" || o.property === "") {
+      throw new BaseEvaluationError("`groupBy:` needs a `property`.");
     }
-    return 0;
+    return { property: o.property, dir: direction(o.direction) };
+  }
+  throw new BaseEvaluationError("`groupBy:` must be {property, direction}.");
+}
+
+/** Empty values (missing, "", []) all fall in the "no value" group. */
+function normaliseGroupValue(v: unknown): unknown {
+  return isEmptyValue(v) ? null : v;
+}
+
+function kind(v: unknown): string {
+  if (v === null || v === undefined) return "null";
+  if (v instanceof Date) return "date";
+  if (Array.isArray(v)) return "list";
+  return typeof v;
+}
+
+/** Groups match on type and value: `5` and `"5"` are different groups. */
+function sameGroup(a: unknown, b: unknown): boolean {
+  return kind(a) === kind(b) && (kind(a) === "null" || equals(a, b));
+}
+
+/** Missing values sort last in either direction. */
+function compareSortValues(a: unknown, b: unknown, dir: 1 | -1): number {
+  const aEmpty = isEmptyValue(a);
+  const bEmpty = isEmptyValue(b);
+  if (aEmpty || bEmpty) return aEmpty === bEmpty ? 0 : aEmpty ? 1 : -1;
+  let c = compareValues(a, b);
+  if (c === null) {
+    c = toText(a).localeCompare(toText(b));
+  } else if (typeof a === "string" && typeof b === "string" && !asDate(a)) {
+    c = a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" }) || c;
+  }
+  return Math.sign(c) * dir;
+}
+
+function sortContexts(list: EvalContext[], keys: SortKey[], tick: () => void): EvalContext[] {
+  if (keys.length === 0) return list;
+  const decorated = list.map((ctx, i) => {
+    tick();
+    return { ctx, i, values: keys.map((k) => propertyValue(k.property, ctx)) };
   });
-  return copy;
+  decorated.sort((a, b) => {
+    for (let k = 0; k < keys.length; k++) {
+      const c = compareSortValues(a.values[k], b.values[k], keys[k]!.dir);
+      if (c !== 0) return c;
+    }
+    return a.i - b.i;
+  });
+  return decorated.map((d) => d.ctx);
 }
 
-function projectRow(entry: BaseEntry, columns: unknown): BaseRow {
-  if (columns === undefined || columns === null) {
-    // Default projection: basic file fields.
-    return {
-      file: { name: entry.file.name, path: entry.file.path },
-    };
-  }
-  if (!Array.isArray(columns)) {
-    throw new BaseEvaluationError(
-      "`columns:` must be a list of column paths or {column, as} objects.",
-    );
-  }
-  const row: BaseRow = {
-    file: { name: entry.file.name, path: entry.file.path },
-  };
-  for (const col of columns) {
-    if (typeof col === "string") {
-      const key = col.startsWith("frontmatter.") ? col.slice("frontmatter.".length) : col;
-      row[key] = toPrimitive(resolvePath(col, entry));
-    } else if (col && typeof col === "object") {
-      const o = col as { column?: unknown; as?: unknown };
-      if (typeof o.column !== "string") {
-        throw new BaseEvaluationError(
-          "`columns:` item is missing a string 'column'.",
-        );
-      }
-      const alias = typeof o.as === "string" ? o.as : o.column;
-      row[alias] = toPrimitive(resolvePath(o.column, entry));
+// ---------------------------------------------------------------------------
+// Projection
+// ---------------------------------------------------------------------------
+
+interface Column {
+  id: string;
+  key: string;
+}
+
+function readColumns(raw: unknown): Column[] {
+  if (raw === undefined || raw === null) return [];
+  if (!Array.isArray(raw)) throw new BaseEvaluationError("`order:` must be a list of property ids.");
+  const out: Column[] = [];
+  for (const col of raw) {
+    if (typeof col === "string") out.push({ id: col, key: columnKey(col) });
+    else if (col && typeof col === "object") {
+      // Legacy `{column, as}`.
+      const o = col as { column?: unknown; property?: unknown; as?: unknown };
+      const id = typeof o.property === "string" ? o.property : typeof o.column === "string" ? o.column : null;
+      if (id === null) throw new BaseEvaluationError(`Invalid column: ${JSON.stringify(col)}.`);
+      out.push({ id, key: typeof o.as === "string" ? o.as : columnKey(id) });
     } else {
-      throw new BaseEvaluationError(
-        `Invalid column item: ${JSON.stringify(col)}.`,
-      );
+      throw new BaseEvaluationError(`Invalid column: ${JSON.stringify(col)}.`);
+    }
+  }
+  return out;
+}
+
+/**
+ * Row key for a property id: note properties drop their `note.` /
+ * `frontmatter.` prefix (`note.status` → `status`); `file.*` and
+ * `formula.*` keep theirs. A note property literally named `file` keeps
+ * `note.file` so it can't overwrite the row's `file` object.
+ */
+function columnKey(id: string): string {
+  let key = id;
+  if (id.startsWith("note.")) key = id.slice(5);
+  else if (id.startsWith("frontmatter.")) key = id.slice(12);
+  return key === "file" ? "note.file" : key;
+}
+
+function projectRow(ctx: EvalContext, columns: Column[], formulas: CompiledFormulas, warn: (msg: string) => void): BaseRow {
+  const f = ctx.entry.file;
+  const row: BaseRow = { file: { name: f.name, basename: f.basename, path: f.path } };
+  for (const col of columns) {
+    // Statically broken columns were reported once already.
+    if (!isKnownPropertyId(col.id) || (col.id.startsWith("formula.") && formulas.problem(col.id.slice(8)))) {
+      row[col.key] = null;
+      continue;
+    }
+    try {
+      row[col.key] = toOutput(propertyValue(col.id, ctx));
+    } catch (err) {
+      if (err instanceof ResourceLimitError) throw err;
+      if (!(err instanceof UnsupportedConstructError) && !(err instanceof BaseEvaluationError)) throw err;
+      row[col.key] = null;
+      warn(`${col.id}: ${err.message}`);
     }
   }
   return row;
 }
 
-function toPrimitive(v: unknown): unknown {
+/**
+ * JSON-safe output value. Date-only values → local `YYYY-MM-DD`; dates with
+ * a time → ISO 8601; files → paths; durations → milliseconds.
+ */
+export function toOutput(v: unknown): unknown {
   if (v === null || v === undefined) return null;
-  if (
-    typeof v === "string" ||
-    typeof v === "number" ||
-    typeof v === "boolean"
-  ) {
-    return v;
+  if (typeof v === "string" || typeof v === "boolean") return v;
+  if (typeof v === "number") return Number.isFinite(v) ? v : null;
+  if (v instanceof Date) {
+    if (Number.isNaN(v.getTime())) return null;
+    return isDateOnly(v) ? formatLocalDate(v) : v.toISOString();
   }
-  if (Array.isArray(v)) {
-    return v.map((x) => toPrimitive(x));
-  }
-  if (v instanceof Date) return v.toISOString();
+  if (v instanceof FileRef) return v.entry.file.path;
+  if (v instanceof Duration) return v.ms;
+  if (Array.isArray(v)) return v.map(toOutput);
   if (typeof v === "object") {
     const out: Record<string, unknown> = {};
-    for (const [k, val] of Object.entries(v as Record<string, unknown>)) {
-      out[k] = toPrimitive(val);
-    }
+    for (const [k, val] of Object.entries(v as Record<string, unknown>)) out[k] = toOutput(val);
     return out;
   }
   return String(v);

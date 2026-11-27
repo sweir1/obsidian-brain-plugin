@@ -12,6 +12,10 @@
  */
 
 import { parse as parseYamlImpl } from "yaml";
+import momentImpl from "moment";
+
+/** Obsidian re-exports Moment; the real package is installed with `obsidian`. */
+export const moment = momentImpl;
 
 export function parseYaml(src: string): unknown {
   return parseYamlImpl(src);
@@ -36,3 +40,32 @@ export class App {}
 
 export type PluginManifest = { id: string; version: string };
 export type TFile = unknown;
+
+/**
+ * Obsidian's `getAllTags`: frontmatter tags (every key matching
+ * /^tags?$/i — `tags`, `tag`, `Tags`, ...; a string value is split on
+ * commas and whitespace; `#` is added), then the body's inline tags.
+ * No de-duplication, as in Obsidian.
+ */
+export function getAllTags(cache: {
+  frontmatter?: Record<string, unknown>;
+  tags?: Array<{ tag: string }>;
+}): string[] | null {
+  const out: string[] = [];
+  const fm = cache.frontmatter;
+  if (fm) {
+    for (const key of Object.keys(fm)) {
+      if (!/^tags?$/i.test(key)) continue;
+      const raw = fm[key];
+      const values = Array.isArray(raw) ? raw : typeof raw === "string" ? raw.split(/[,\s]+/) : raw == null ? [] : [raw];
+      for (const v of values) {
+        if (v === null || v === undefined) continue;
+        const t = String(v).trim();
+        if (t === "") continue;
+        out.push(t.startsWith("#") ? t : `#${t}`);
+      }
+    }
+  }
+  for (const t of cache.tags ?? []) out.push(t.tag);
+  return out;
+}

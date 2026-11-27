@@ -38,9 +38,9 @@ On plugin unload, the HTTP server shuts down and the discovery file is removed.
 | GET | `/status` | Health check + plugin version + vault name + advertised capabilities. | v0.1.0 |
 | GET | `/active` | Active note path + cursor + selection. | v0.1.0 |
 | POST | `/dataview` | Run a Dataview DQL query via the installed Dataview community plugin. Returns a normalized `{kind, ...}` shape (table / list / task / calendar). Requires the Dataview plugin installed + enabled; returns `424` otherwise. | v0.2.0 |
-| POST | `/base` | Evaluate an Obsidian Bases `.base` file (YAML + view name) and return rows. Requires Obsidian ≥ 1.10.0 with the Bases core plugin enabled; returns `424` otherwise. | v1.4.0 |
+| POST | `/base` | Evaluate an Obsidian Bases `.base` file (one of its views) and return rows. Requires Obsidian ≥ 1.10.0 with the Bases core plugin enabled; returns `424` otherwise. | v1.4.0 |
 
-All responses are JSON. `POST /dataview` accepts a body of `{query: string, source?: string}` up to 256KB; requests are serialised (one in-flight at a time) since Dataview has no cancellation API. `POST /base` accepts `{file?: string, yaml?: string, view: string}` — either `file` (vault-relative path to a `.base` file) or `yaml` (inline source) is required. Requests to `/base` are serialised on their own queue since the evaluator walks every markdown file to build entries.
+All responses are JSON. `POST /dataview` accepts a body of `{query: string, source?: string}` up to 256KB; requests are serialised (one in-flight at a time) since Dataview has no cancellation API. `POST /base` accepts `{file?: string, yaml?: string, view?: string}` — either `file` (vault-relative path to a `.base` file) or `yaml` (inline source) is required; `view` names the view to run and defaults to the first one, as when Obsidian opens a base. It returns `{view, rows, total, groupBy?, groups?, warnings?, executedAt}`. Requests to `/base` are serialised on their own queue since the evaluator walks every file in the vault.
 
 ## About the "Dataview community plugin"
 
@@ -98,7 +98,7 @@ Further reading: Dataview's [plugin-author guide](https://blacksmithgu.github.io
 
 ## About Obsidian Bases
 
-Bases is different from Dataview in two ways that matter here: it is a **core** Obsidian feature (shipped with Obsidian 1.10.0, not a third-party community plugin), and as of Obsidian 1.12.x it has **no public API for headless query execution**. That pair of facts shapes how the `/base` route works.
+Bases is different from Dataview in two ways that matter here: it is a **core** Obsidian feature (not a third-party community plugin), and Obsidian has **no public API for running a base headlessly** and reading its rows. That pair of facts shapes how the `/base` route works.
 
 ### The three pieces
 
@@ -106,41 +106,37 @@ Bases is different from Dataview in two ways that matter here: it is a **core** 
 |---|---|---|---|
 | 1 | **`obsidian-brain`** | us — [sweir1/obsidian-brain](https://github.com/sweir1/obsidian-brain) | The MCP server (Node package on npm). Your MCP client spawns it. |
 | 2 | **`obsidian-brain-companion`** | us — this repo | The Obsidian plugin you're reading docs for. Exposes `/base`. |
-| 3 | **Bases** | [Obsidian](https://obsidian.md) (first-party, core plugin) | YAML-declared views over the vault's metadata cache. Shipped with Obsidian ≥ 1.10.0. User toggles it on under Settings → Core plugins. |
+| 3 | **Bases** | [Obsidian](https://obsidian.md) (first-party, core plugin) | YAML-declared views over the vault. User toggles it on under Settings → Core plugins. |
 
-No runtime dependency on `obsidian-bases` (there is no such npm package — Bases lives inside Obsidian itself).
+No runtime dependency on `obsidian-bases` (there is no such npm package — Bases lives inside Obsidian itself). Because Bases is a core plugin, the companion checks Obsidian's core-plugin registry to see whether it's on.
 
-### Why Path B (own YAML + expression evaluator)
+### How a base is evaluated
 
-Unlike Dataview — where `app.plugins.plugins.dataview.api.query(...)` is a sanctioned read path — Obsidian 1.12.x exposes Bases with only the view-factory hook, `Plugin.registerBasesView()`. The public type surface in `obsidian.d.ts` includes:
+Obsidian exposes Bases to plugins only through view hooks (`Plugin.registerBasesView()`, `BasesView`, `BasesQueryResult`); there is no `runQuery(config)` that returns rows. So the companion reads the `.base` YAML itself and evaluates it against the vault, following the [Bases syntax](https://help.obsidian.md/bases/syntax):
 
-- `BasesQueryResult` (the shape views receive for rendering)
-- `BasesEntry` (one row; `file: TFile`, `getValue(propertyId): Value | null`)
-- `BasesView` (abstract view base class, constructed with a `QueryController`)
-- `QueryController` — empty class body. No public method to execute a query against user-supplied config.
-- `Plugin.registerBasesView(viewId, registration): boolean` — registers a custom view type.
+- **Rows:** every file in the vault, as in Obsidian — notes and attachments. Note properties come from the metadata cache; properties typed as Date or Date & time in Settings → Properties are dates, and untyped `YYYY-MM-DD` values still work as dates. Tags come from Obsidian's own `getAllTags`. Files at the vault root have `file.folder` `"/"`.
+- **Views:** the `views:` list; the requested view by name (or the first one). Every view type — table, cards, list, kanban, map, or a plugin's — selects rows the same way.
+- **Filters:** global and view `filters:`, combined with AND. `and` / `or` / `not` groups nest; `not` excludes a file if **any** listed condition holds ("None of the following are true"). An empty group imposes no condition. A group may use only one of `and` / `or` / `not`, and a misspelt key (`And:`, `nor:`) is an error rather than a filter that silently matches nothing.
+- **Expressions:** literals and `[lists]`; note properties as `note.x`, `note["x"]` or bare `x`; `file.name` (with extension), `file.basename`, `path`, `folder`, `ext`, `size`, `ctime`, `mtime`, `tags`, `links`, `embeds`, `backlinks`, `properties`; `formula.x`; indexing; arithmetic `+ - * / %`, including date ± duration (`now() - "1 week"`) and date − date; comparisons; `&&` `||` `!`.
+- **Functions:** `if`, `list`, `number`, `min`, `max`, `date`, `now`, `today`, `duration`; `file.hasTag` (any of several, nested tags included), `file.inFolder`, `file.hasLink`, `file.hasProperty`; string `contains` / `containsAll` / `containsAny` / `startsWith` / `endsWith` / `lower` / `title` / `trim` / `replace` (plain text) / `repeat` / `reverse` / `slice` / `split`; number `abs` / `ceil` / `floor` / `round` / `toFixed`; list `contains*` / `join` / `flat` / `unique` / `reverse` / `slice` / `sort`; date fields (`year` … `millisecond`), `date()`, `time()`, `format()`, `relative()`; object `keys` / `values`; `isEmpty`, `isTruthy`, `isType`, `toString` on anything.
+- **Formulas:** `formulas:` entries are computed per row and can build on each other; circular formulas are an error.
+- **Columns:** `order:` lists the columns. Each row has `file: {name, basename, path}` plus one key per column — note properties without the `note.` prefix (`status`), others as written (`file.mtime`, `formula.ppu`). Dates without a time are `YYYY-MM-DD`; dates with a time are ISO 8601.
+- **Sort, group, limit:** `sort:` (`{property, direction}` list), `groupBy:` with `groupOrder:` (only listed groups, in that order; `null` = files with no value), and `limit:`. `total` counts rows before the limit; grouped views also return `groups: [{value, count}]`.
+- **Ignored:** `properties:` (display names), `summaries:`, `columnSize:` and any other display-only keys.
 
-What is **missing**: any `app.bases.runQuery(config)`, `app.bases.getViewFiles(path)`, or `new QueryController({filters, views})` wired to produce a `BasesQueryResult` we can read. A [forum request](https://forum.obsidian.md/t/provide-api-access-to-the-results-of-bases-view/110660) opened 2026-01-31 to expose this surface is still unacknowledged as of 2026-04-22.
+### What it can't evaluate
 
-So our plugin takes **Path B**: parse the `.base` YAML ourselves via Obsidian's bundled `parseYaml`, iterate `app.vault.getMarkdownFiles()` + `app.metadataCache.getFileCache(file)` to build entries, and run a whitelisted expression evaluator against the filter tree.
+These return `400 unsupported_construct` naming the construct, rather than wrong rows: `this` (it depends on where Obsidian displays the base), regular expressions and `.matches()`, list lambdas (`filter` / `map` / `reduce`), and display-only functions (`link`, `image`, `icon`, `html`, `escapeHTML`, `random`, `file()`, `asLink`). Everything is checked before any row is evaluated, so the result never depends on which files happen to be in the vault. A formula that can't be computed fails the query when a filter, sort or group needs it; when it's only a **column**, that column is `null` with a note in `warnings`, so one display-only formula doesn't fail the whole query. A value of the wrong type in one note (`status.lower()` where one note has `status: 5`) makes that note's value `null`, with a warning.
 
-### What that whitelist covers (v1.4.0)
+`due-date` means `due` minus `date`, as in Obsidian; write `note["due-date"]` for a property with a hyphen (you get a warning when that's probably what you meant). Adding a bare number to a date (`today() + 7`) gives `null` with a warning; add a duration such as `"7d"`.
 
-- Tree ops: `and`, `or`, `not` (nested).
-- Comparisons: `==`, `!=`, `>`, `>=`, `<`, `<=`.
-- Leaf-string boolean: `&&`, `||`, `!` in expressions like `file.hasTag("book") && status == "reading"`.
-- File props: `file.{name, path, folder, ext, size, mtime, ctime, tags}`.
-- File methods: `file.hasTag("x")`, `file.inFolder("x")`.
-- Frontmatter: `frontmatter.X`, bare `X`, nested `X.sub.leaf`.
-- View `sort:`, `limit:`, `columns:`.
+### Limits
 
-### What that whitelist **explicitly rejects** (with clear `unsupported_construct` errors naming the fragment)
+The evaluator runs inside Obsidian, where a runaway query can't be interrupted, so it fails with `400 base_eval_error` instead of hanging or running out of memory: expressions up to 20,000 characters and 200 levels of nesting, filters up to 10,000 conditions and 64 levels, formula chains up to 64 deep, function results up to 1,000,000 characters or 100,000 list items, and 10 seconds per query. A recursive YAML anchor in `filters:` is an error.
 
-Arithmetic (`+ - * / %`), date arithmetic with duration strings, method calls other than `.hasTag` / `.inFolder`, function calls (`today()`, `now()`, `date()`, `list()`, `link()`, `icon()`), regex literals, top-level `formulas:` block, top-level `summaries:` block, `this` context references. These are deferred to v1.4.1 / v1.4.2 / v1.4.3 patches as users hit them.
+`file` must be a vault-relative path to a `.base` file; absolute paths and `..` are rejected, and the file is read through the vault.
 
-### Planned: swap to Path A when upstream ships the API
-
-When Obsidian exposes `app.bases.runQuery(...)` (or equivalent), we plan a drop-in swap. The `BasesEntry` / `BasesQueryResult` type surface has been stable since 1.10.0, and our response shape already mirrors it closely (`{view, rows, total, executedAt}` → `{view, data, total, executedAt}` maps cleanly onto `BasesQueryResult.data: BasesEntry[]`). Clients of `base_query` won't need to change.
+Files written by earlier companion versions — `views:` as a map keyed by name, `columns:` instead of `order:`, `sort: [{column}]`, `frontmatter.x`, and the `{property: {">=": 4}}` filter shorthand — still work.
 
 ### Install Bases (it's core, not community)
 
